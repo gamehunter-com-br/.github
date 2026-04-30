@@ -1,0 +1,90 @@
+name: Publish Package (reusable)
+
+# Reusable workflow que publica package npm no GitHub Packages quando
+# tag vX.Y.Z e pushada. Substitui copia quase-identica em 4 libs:
+# contracts, api-client, integrations, scrapers (4 x ~42 LoC = 168 LoC
+# duplicadas reduzidas a este unico arquivo).
+#
+# Design (gamehunter-design) usa workflow proprio (Changesets + Turbo
+# + monorepo) — nao migrado pra este reusable.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: 'Node version to setup'
+        required: false
+        default: '22'
+        type: string
+      runner:
+        description: 'GitHub Actions runner label'
+        required: false
+        default: blacksmith-4vcpu-ubuntu-2404
+        type: string
+      build-command:
+        description: 'Build command (executed before publish)'
+        required: false
+        default: 'npm run build'
+        type: string
+      publish-command:
+        description: 'Publish command'
+        required: false
+        default: 'npm publish'
+        type: string
+      needs-cross-repo-deps:
+        description: 'Set true if package depends on other @gamehunter-com-br/* packages (uses NPM_PACKAGES_READ_TOKEN for npm ci)'
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      NPM_PACKAGES_READ_TOKEN:
+        description: 'PAT com read:packages — required quando needs-cross-repo-deps=true'
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require release tag on main
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          git fetch --force origin main:refs/remotes/origin/main
+          TAG_SHA="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
+          if ! git merge-base --is-ancestor "$TAG_SHA" origin/main; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} (${TAG_SHA}) is not reachable from origin/main. Merge it to main before publishing."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@gamehunter-com-br'
+          cache: npm
+
+      - name: Install deps (cross-repo)
+        if: ${{ inputs.needs-cross-repo-deps }}
+        run: npm ci
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_PACKAGES_READ_TOKEN }}
+
+      - name: Install deps (no cross-repo)
+        if: ${{ !inputs.needs-cross-repo-deps }}
+        run: npm ci
+
+      - name: Build
+        run: ${{ inputs.build-command }}
+
+      - name: Publish
+        run: ${{ inputs.publish-command }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
