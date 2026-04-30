@@ -1,0 +1,28 @@
+name: 'Setup Node + pnpm'
+description: 'Setup Node 22 + pnpm + GitHub Packages registry com cache padrao GameHunter'
+
+inputs:
+  node-version:
+    description: 'Node version (default 22)'
+    required: false
+    default: '22'
+  scope:
+    description: 'npm scope (default @gamehunter-com-br)'
+    required: false
+    default: '@gamehunter-com-br'
+  registry-url:
+    description: 'npm registry URL'
+    required: false
+    default: 'https://npm.pkg.github.com'
+
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@v4
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: pnpm
+        registry-url: ${{ inputs.registry-url }}
+        scope: ${{ inputs.scope }}

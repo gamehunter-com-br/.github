@@ -1,0 +1,30 @@
+name: 'Cloudflare cache purge (full)'
+description: 'Purge Cloudflare cache via Worker /ops/purge endpoint'
+
+inputs:
+  revalidate-token:
+    description: 'Bearer token pra autenticar no Worker /ops/purge'
+    required: true
+  endpoint:
+    description: 'URL do worker purge endpoint'
+    required: false
+    default: 'https://gamehunter.com.br/ops/purge'
+
+runs:
+  using: composite
+  steps:
+    - name: Purge Cloudflare cache (full)
+      shell: bash
+      env:
+        REVALIDATE_TOKEN: ${{ inputs.revalidate-token }}
+        ENDPOINT: ${{ inputs.endpoint }}
+      run: |
+        if [ -z "$REVALIDATE_TOKEN" ]; then
+          echo "Aviso: revalidate-token nao configurado, pulando CF purge"
+          exit 0
+        fi
+        curl -fsS -X POST "$ENDPOINT" \
+          -H "Authorization: Bearer $REVALIDATE_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d '{"purge_everything":true}'
+        echo "OK CF purge via Worker"

@@ -1,0 +1,23 @@
+name: 'Require ref on main'
+description: 'Valida que GITHUB_REF eh ancestor de origin/main (politica tag-only deploy)'
+
+inputs:
+  release-token:
+    description: 'PAT com contents:read pra fetch de origin/main'
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Require ref on main
+      shell: bash
+      env:
+        RELEASE_TOKEN: ${{ inputs.release-token }}
+      run: |
+        set -euo pipefail
+        git fetch --force "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main:refs/remotes/origin/main
+        if ! git merge-base --is-ancestor HEAD origin/main; then
+          echo "::error::Ref ${GITHUB_REF_NAME} is not reachable from origin/main. Merge it to main before tagging or deploying."
+          exit 1
+        fi
