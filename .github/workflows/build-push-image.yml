@@ -3,13 +3,6 @@ name: Build & push image (reusable)
 # Reusable workflow que builda imagem Docker e publica em ghcr.io.
 # Substitui copia (~95 LoC) em backend, frontend, admin (3 x ~95 = 285 LoC
 # duplicados reduzidos a este unico arquivo).
-#
-# Tags por trigger:
-#   - tag push (v1.2.3)  -> :v1.2.3 + :sha-<sha>  (production)
-#   - main push          -> :main-latest + :sha-<sha>  (staging)
-#   - manual dispatch    -> :sha-<sha> apenas
-#
-# Politica: deploy de prod SEMPRE via tag semver, nunca via main-latest.
 
 on:
   workflow_call:
@@ -30,23 +23,14 @@ on:
         default: .
         type: string
       extra-build-args:
-        description: 'Build args adicionais (multi-line, KEY=VALUE format). Secrets sao auto-masked pelos logs.'
+        description: 'Build args adicionais (multi-line, KEY=VALUE format).'
         required: false
         default: ''
         type: string
-    outputs:
-      image:
-        description: 'Image name (ghcr.io/owner/repo)'
-        value: ${{ jobs.build-push.outputs.image }}
-      tags:
-        description: 'Comma-separated tags published'
-        value: ${{ jobs.build-push.outputs.tags }}
-      short-sha:
-        description: 'Short commit SHA'
-        value: ${{ jobs.build-push.outputs.short_sha }}
-      deploy-target:
-        description: 'production / staging / preview'
-        value: ${{ jobs.build-push.outputs.deploy_target }}
+    secrets:
+      NPM_PACKAGES_READ_TOKEN:
+        description: 'PAT com read:packages pra cross-repo deps. Fallback pra GITHUB_TOKEN.'
+        required: false
 
 permissions:
   contents: read
@@ -59,11 +43,6 @@ concurrency:
 jobs:
   build-push:
     runs-on: ${{ inputs.runner }}
-    outputs:
-      image: ${{ steps.meta.outputs.image }}
-      tags: ${{ steps.meta.outputs.tags }}
-      short_sha: ${{ steps.meta.outputs.short_sha }}
-      deploy_target: ${{ steps.meta.outputs.deploy_target }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -76,7 +55,7 @@ jobs:
           git fetch --force origin main:refs/remotes/origin/main
           TAG_SHA="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
           if ! git merge-base --is-ancestor "$TAG_SHA" origin/main; then
-            echo "::error::Release tag ${GITHUB_REF_NAME} (${TAG_SHA}) is not reachable from origin/main. Merge it to main before pushing a production tag."
+            echo "::error::Release tag ${GITHUB_REF_NAME} (${TAG_SHA}) is not reachable from origin/main."
             exit 1
           fi
 
@@ -89,17 +68,18 @@ jobs:
 
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             TAGS="${IMAGE}:${REF_NAME},${IMAGE}:sha-${SHORT_SHA}"
-            echo "deploy_target=production" >> $GITHUB_OUTPUT
+            DEPLOY_TARGET="production"
           elif [[ "$GITHUB_REF_NAME" == "main" ]]; then
             TAGS="${IMAGE}:main-latest,${IMAGE}:sha-${SHORT_SHA}"
-            echo "deploy_target=staging" >> $GITHUB_OUTPUT
+            DEPLOY_TARGET="staging"
           else
             TAGS="${IMAGE}:sha-${SHORT_SHA}"
-            echo "deploy_target=preview" >> $GITHUB_OUTPUT
+            DEPLOY_TARGET="preview"
           fi
 
           echo "image=${IMAGE}" >> $GITHUB_OUTPUT
           echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "deploy_target=${DEPLOY_TARGET}" >> $GITHUB_OUTPUT
           echo "tags<<EOF" >> $GITHUB_OUTPUT
           echo "$TAGS" | tr ',' '\n' >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -137,9 +117,3 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Tags publicados:" >> $GITHUB_STEP_SUMMARY
           echo '${{ steps.meta.outputs.tags }}' | sed 's/^/- `/' | sed 's/$/`/' >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ steps.meta.outputs.deploy_target }}" == "production" ]]; then
-            echo "🚀 Deploy de produção dispara automaticamente via deploy.yml." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "⚠️ Build não-produção. Pra deploy real, criar tag semver." >> $GITHUB_STEP_SUMMARY
-          fi
