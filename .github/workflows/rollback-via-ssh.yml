@@ -1,10 +1,6 @@
 name: Rollback via SSH (reusable)
 
 # Reusable workflow que faz rollback rapido pra tag/sha specifico.
-# Substitui copia (~60 LoC) em backend, frontend, admin (3 x ~60 = 180 LoC
-# duplicados reduzidos a este unico arquivo).
-#
-# Trigger no consumer: workflow_dispatch com input "tag".
 
 on:
   workflow_call:
@@ -75,9 +71,7 @@ jobs:
 
       - name: Restore image tag on VPS
         env:
-          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
-          GH_OWNER: ${{ github.repository_owner }}
-          IMAGE: ghcr.io/${{ github.repository }}
+          IMAGE_BASE: ghcr.io/${{ github.repository }}
           TAG: ${{ inputs.tag }}
           SERVICE: ${{ inputs.service-name }}
           VPS_PATH: ${{ inputs.vps-path }}
@@ -86,33 +80,30 @@ jobs:
           HEALTH_PATH: ${{ inputs.health-path }}
           DEFAULT_PORT: ${{ inputs.default-port }}
           EXTRA_SERVICES: ${{ inputs.extra-services }}
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+          GH_OWNER: ${{ github.repository_owner }}
         run: |
-          IMAGE_LOWER="$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')"
-          echo "Rolling back to $IMAGE_LOWER:$TAG"
+          IMAGE=$(echo "$IMAGE_BASE" | tr '[:upper:]' '[:lower:]')
+          echo "Rolling back to $IMAGE:$TAG"
 
-          ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" \
-            IMAGE="$IMAGE_LOWER" TAG="$TAG" SERVICE="$SERVICE" \
-            VPS_PATH="$VPS_PATH" HEALTH_PATH="$HEALTH_PATH" \
-            DEFAULT_PORT="$DEFAULT_PORT" EXTRA_SERVICES="$EXTRA_SERVICES" \
-            GHCR_PULL_TOKEN="$GHCR_PULL_TOKEN" GH_OWNER="$GH_OWNER" \
-            'bash -euo pipefail -s' << 'REMOTE'
+          ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" 'bash -euo pipefail -s' << EOF
             cd "$VPS_PATH"
 
             echo "$GHCR_PULL_TOKEN" | docker login ghcr.io -u "$GH_OWNER" --password-stdin
 
             export IMAGE_TAG="$TAG"
             grep -v "^IMAGE_TAG=" .env > .env.new || true
-            echo "IMAGE_TAG=$IMAGE_TAG" >> .env.new
+            echo "IMAGE_TAG=\$IMAGE_TAG" >> .env.new
             mv .env.new .env
 
             ALL_SERVICES="$SERVICE $EXTRA_SERVICES"
-            docker compose pull $ALL_SERVICES
-            docker compose up -d --no-build $ALL_SERVICES
+            docker compose pull \$ALL_SERVICES
+            docker compose up -d --no-build \$ALL_SERVICES
 
-            PORT=$(grep "^PORT=" .env | cut -d= -f2 | head -1)
-            PORT=${PORT:-$DEFAULT_PORT}
-            for i in $(seq 1 30); do
-              if curl -fsS "http://localhost:$PORT$HEALTH_PATH" > /dev/null 2>&1; then
+            PORT=\$(grep "^PORT=" .env | cut -d= -f2 | head -1)
+            PORT=\${PORT:-$DEFAULT_PORT}
+            for i in \$(seq 1 30); do
+              if curl -fsS "http://localhost:\$PORT$HEALTH_PATH" > /dev/null 2>&1; then
                 echo "OK Rollback to $TAG"
                 docker logout ghcr.io
                 exit 0
@@ -122,7 +113,7 @@ jobs:
             echo "FAIL Health pos-rollback — investigar manual"
             docker logout ghcr.io
             exit 1
-          REMOTE
+          EOF
 
       - name: Summary
         if: always()

@@ -1,11 +1,6 @@
 name: Deploy via SSH (reusable)
 
 # Reusable workflow que deploya imagem via SSH no VPS GameHunter.
-# Substitui copia (~140 LoC) em backend, frontend, admin (3 x ~140 = 420 LoC
-# duplicados reduzidos a este unico arquivo).
-#
-# Trigger no consumer: workflow_run de "Build & push image" (auto on tag)
-# OU workflow_dispatch (manual com tag input).
 
 on:
   workflow_call:
@@ -19,7 +14,7 @@ on:
         required: true
         type: string
       vps-host:
-        description: 'VPS host (default IP do GameHunter)'
+        description: 'VPS host'
         required: false
         default: '82.29.59.75'
         type: string
@@ -29,37 +24,37 @@ on:
         default: root
         type: string
       health-path:
-        description: 'Health check endpoint (default /health)'
+        description: 'Health check endpoint'
         required: false
         default: /health
         type: string
       default-port:
-        description: 'Default port pra health check (override por .env PORT)'
+        description: 'Default port pra health check'
         required: false
         default: '3001'
         type: string
       extra-services:
-        description: 'Services adicionais pra restart (ex: workers)'
+        description: 'Services adicionais (ex: workers)'
         required: false
         default: ''
         type: string
       migration-cmd:
-        description: 'Comando de migration (executado antes do up). Ex: npm run migrate. Vazio = pula.'
+        description: 'Comando de migration (ex: npm run migrate). Vazio pula.'
         required: false
         default: ''
         type: string
       purge-cf:
-        description: 'Purgar Cloudflare cache full apos deploy ok'
+        description: 'Purgar CF cache full pos deploy ok'
         required: false
         default: true
         type: boolean
       runner:
-        description: 'GitHub Actions runner label'
+        description: 'GitHub Actions runner'
         required: false
         default: blacksmith-4vcpu-ubuntu-2404
         type: string
       tag:
-        description: 'Tag pra deployar (passa do workflow_dispatch input do stub; vazio = pega do workflow_run)'
+        description: 'Tag pra deployar (workflow_dispatch input passthrough)'
         required: false
         default: ''
         type: string
@@ -120,8 +115,6 @@ jobs:
 
       - name: Pull image and restart on VPS
         env:
-          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
-          GH_OWNER: ${{ github.repository_owner }}
           IMAGE: ${{ steps.tag.outputs.image }}
           TAG: ${{ steps.tag.outputs.tag }}
           SERVICE: ${{ inputs.service-name }}
@@ -132,14 +125,11 @@ jobs:
           DEFAULT_PORT: ${{ inputs.default-port }}
           EXTRA_SERVICES: ${{ inputs.extra-services }}
           MIGRATION_CMD: ${{ inputs.migration-cmd }}
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+          GH_OWNER: ${{ github.repository_owner }}
         run: |
-          ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" \
-            IMAGE="$IMAGE" TAG="$TAG" SERVICE="$SERVICE" \
-            VPS_PATH="$VPS_PATH" HEALTH_PATH="$HEALTH_PATH" \
-            DEFAULT_PORT="$DEFAULT_PORT" EXTRA_SERVICES="$EXTRA_SERVICES" \
-            MIGRATION_CMD="$MIGRATION_CMD" \
-            GHCR_PULL_TOKEN="$GHCR_PULL_TOKEN" GH_OWNER="$GH_OWNER" \
-            'bash -euo pipefail -s' << 'REMOTE'
+          # Heredoc SEM quote no marker => expansao LOCAL acontece, escapes \$ ficam literal
+          ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" 'bash -euo pipefail -s' << EOF
             cd "$VPS_PATH"
 
             git fetch origin main
@@ -147,31 +137,31 @@ jobs:
 
             echo "$GHCR_PULL_TOKEN" | docker login ghcr.io -u "$GH_OWNER" --password-stdin
 
-            CURRENT=$(docker compose images "$SERVICE" --quiet 2>/dev/null || true)
-            if [ -n "$CURRENT" ]; then
-              docker tag "$CURRENT" "$IMAGE:rollback" || true
+            CURRENT=\$(docker compose images "$SERVICE" --quiet 2>/dev/null || true)
+            if [ -n "\$CURRENT" ]; then
+              docker tag "\$CURRENT" "$IMAGE:rollback" || true
             fi
 
             export IMAGE_TAG="$TAG"
             grep -v "^IMAGE_TAG=" .env > .env.new || true
-            echo "IMAGE_TAG=$IMAGE_TAG" >> .env.new
+            echo "IMAGE_TAG=\$IMAGE_TAG" >> .env.new
             mv .env.new .env
 
             ALL_SERVICES="$SERVICE $EXTRA_SERVICES"
-            docker compose pull $ALL_SERVICES
+            docker compose pull \$ALL_SERVICES
 
             if [ -n "$MIGRATION_CMD" ]; then
               docker compose run -T --rm --no-deps "$SERVICE" $MIGRATION_CMD < /dev/null
             fi
 
-            docker compose up -d --no-build --force-recreate $ALL_SERVICES
+            docker compose up -d --no-build --force-recreate \$ALL_SERVICES
 
-            PORT=$(grep "^PORT=" .env | cut -d= -f2 | head -1)
-            PORT=${PORT:-$DEFAULT_PORT}
-            echo "Health check em localhost:$PORT$HEALTH_PATH"
-            for i in $(seq 1 30); do
-              if curl -fsS "http://localhost:$PORT$HEALTH_PATH" > /dev/null 2>&1; then
-                echo "OK $SERVICE healthy on tag $IMAGE_TAG"
+            PORT=\$(grep "^PORT=" .env | cut -d= -f2 | head -1)
+            PORT=\${PORT:-$DEFAULT_PORT}
+            echo "Health check em localhost:\$PORT$HEALTH_PATH"
+            for i in \$(seq 1 30); do
+              if curl -fsS "http://localhost:\$PORT$HEALTH_PATH" > /dev/null 2>&1; then
+                echo "OK $SERVICE healthy on tag \$IMAGE_TAG"
                 docker logout ghcr.io
                 exit 0
               fi
@@ -181,12 +171,12 @@ jobs:
             echo "FAIL: Health check failed after 60s — auto-rolling back"
             export IMAGE_TAG=rollback
             grep -v "^IMAGE_TAG=" .env > .env.new || true
-            echo "IMAGE_TAG=$IMAGE_TAG" >> .env.new
+            echo "IMAGE_TAG=\$IMAGE_TAG" >> .env.new
             mv .env.new .env
-            docker compose up -d --no-build --force-recreate $ALL_SERVICES
+            docker compose up -d --no-build --force-recreate \$ALL_SERVICES
             docker logout ghcr.io
             exit 1
-          REMOTE
+          EOF
 
       - name: Purge Cloudflare cache (full)
         if: success() && inputs.purge-cf
