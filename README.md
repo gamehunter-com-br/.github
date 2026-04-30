@@ -49,6 +49,56 @@ jobs:
       RELEASE_TAG_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
 ```
 
+> ⚠️ **Note:** This reusable creates the tag but does NOT bump `package.json`
+> version. Bump it manually on a PR before triggering promote-release, or
+> the next `npm publish` will fail with E409 conflict.
+
+### `.github/workflows/publish-package.yml`
+
+Publica package npm no GitHub Packages quando tag `vX.Y.Z` é pushada.
+
+**Inputs:**
+- `node-version` (string, default `'22'`)
+- `runner` (string, default `blacksmith-4vcpu-ubuntu-2404`)
+- `build-command` (string, default `npm run build`)
+- `publish-command` (string, default `npm publish`)
+- `needs-cross-repo-deps` (boolean, default `false`) — set `true` se package depende de outros `@gamehunter-com-br/*` (usa `NPM_PACKAGES_READ_TOKEN` em `npm ci`).
+
+**Secrets:**
+- `NPM_PACKAGES_READ_TOKEN` (opcional) — required quando `needs-cross-repo-deps=true`.
+
+**Stub no consumer (~17 LoC):**
+
+```yaml
+name: Publish to GitHub Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    uses: gamehunter-com-br/.github/.github/workflows/publish-package.yml@v1
+    permissions:
+      contents: read
+      packages: write
+    with:
+      needs-cross-repo-deps: true   # opcional
+    secrets:
+      NPM_PACKAGES_READ_TOKEN: ${{ secrets.NPM_PACKAGES_READ_TOKEN }}
+```
+
+> ⚠️ **`permissions: packages: write` é OBRIGATÓRIO no caller** — o reusable
+> declara permissions internamente, mas o GITHUB_TOKEN default tem
+> `packages: read`, e callers de reusable workflows herdam o token do
+> caller. Sem o block `permissions:` na stub, o run falha com
+> `startup_failure` (não chega nem ao step de `npm publish`).
+
 ## Política de versionamento
 
 - Reusable workflows são pinned por **tag semver** (`@v1`) em produção, ou por
