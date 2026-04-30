@@ -1,0 +1,145 @@
+name: Build & push image (reusable)
+
+# Reusable workflow que builda imagem Docker e publica em ghcr.io.
+# Substitui copia (~95 LoC) em backend, frontend, admin (3 x ~95 = 285 LoC
+# duplicados reduzidos a este unico arquivo).
+#
+# Tags por trigger:
+#   - tag push (v1.2.3)  -> :v1.2.3 + :sha-<sha>  (production)
+#   - main push          -> :main-latest + :sha-<sha>  (staging)
+#   - manual dispatch    -> :sha-<sha> apenas
+#
+# Politica: deploy de prod SEMPRE via tag semver, nunca via main-latest.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: 'GitHub Actions runner label'
+        required: false
+        default: blacksmith-4vcpu-ubuntu-2404
+        type: string
+      dockerfile:
+        description: 'Path to Dockerfile'
+        required: false
+        default: Dockerfile
+        type: string
+      context:
+        description: 'Build context dir'
+        required: false
+        default: .
+        type: string
+      extra-build-args:
+        description: 'Build args adicionais (multi-line, KEY=VALUE format). Secrets sao auto-masked pelos logs.'
+        required: false
+        default: ''
+        type: string
+    outputs:
+      image:
+        description: 'Image name (ghcr.io/owner/repo)'
+        value: ${{ jobs.build-push.outputs.image }}
+      tags:
+        description: 'Comma-separated tags published'
+        value: ${{ jobs.build-push.outputs.tags }}
+      short-sha:
+        description: 'Short commit SHA'
+        value: ${{ jobs.build-push.outputs.short_sha }}
+      deploy-target:
+        description: 'production / staging / preview'
+        value: ${{ jobs.build-push.outputs.deploy_target }}
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-push:
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tags: ${{ steps.meta.outputs.tags }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      deploy_target: ${{ steps.meta.outputs.deploy_target }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require release tag on main
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          git fetch --force origin main:refs/remotes/origin/main
+          TAG_SHA="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
+          if ! git merge-base --is-ancestor "$TAG_SHA" origin/main; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} (${TAG_SHA}) is not reachable from origin/main. Merge it to main before pushing a production tag."
+            exit 1
+          fi
+
+      - name: Compute image tags
+        id: meta
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          REF_NAME="${GITHUB_REF_NAME}"
+
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            TAGS="${IMAGE}:${REF_NAME},${IMAGE}:sha-${SHORT_SHA}"
+            echo "deploy_target=production" >> $GITHUB_OUTPUT
+          elif [[ "$GITHUB_REF_NAME" == "main" ]]; then
+            TAGS="${IMAGE}:main-latest,${IMAGE}:sha-${SHORT_SHA}"
+            echo "deploy_target=staging" >> $GITHUB_OUTPUT
+          else
+            TAGS="${IMAGE}:sha-${SHORT_SHA}"
+            echo "deploy_target=preview" >> $GITHUB_OUTPUT
+          fi
+
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "tags<<EOF" >> $GITHUB_OUTPUT
+          echo "$TAGS" | tr ',' '\n' >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache
+          cache-to: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache,mode=max
+          build-args: |
+            NODE_AUTH_TOKEN=${{ secrets.NPM_PACKAGES_READ_TOKEN || secrets.GITHUB_TOKEN }}
+            ${{ inputs.extra-build-args }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+
+      - name: Summary
+        run: |
+          echo "## Image published — ${{ steps.meta.outputs.deploy_target }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Tags publicados:" >> $GITHUB_STEP_SUMMARY
+          echo '${{ steps.meta.outputs.tags }}' | sed 's/^/- `/' | sed 's/$/`/' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ steps.meta.outputs.deploy_target }}" == "production" ]]; then
+            echo "🚀 Deploy de produção dispara automaticamente via deploy.yml." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Build não-produção. Pra deploy real, criar tag semver." >> $GITHUB_STEP_SUMMARY
+          fi

@@ -1,0 +1,131 @@
+name: Rollback via SSH (reusable)
+
+# Reusable workflow que faz rollback rapido pra tag/sha specifico.
+# Substitui copia (~60 LoC) em backend, frontend, admin (3 x ~60 = 180 LoC
+# duplicados reduzidos a este unico arquivo).
+#
+# Trigger no consumer: workflow_dispatch com input "tag".
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Image tag pra restaurar (vX.Y.Z ou sha-XXXXXXX)'
+        required: true
+        type: string
+      service-name:
+        description: 'Service name (backend / frontend / admin)'
+        required: true
+        type: string
+      vps-path:
+        description: 'Path absoluto no VPS'
+        required: true
+        type: string
+      vps-host:
+        description: 'VPS host'
+        required: false
+        default: '82.29.59.75'
+        type: string
+      vps-user:
+        description: 'SSH user'
+        required: false
+        default: root
+        type: string
+      health-path:
+        description: 'Health check endpoint'
+        required: false
+        default: /health
+        type: string
+      default-port:
+        description: 'Default port pra health check'
+        required: false
+        default: '3001'
+        type: string
+      extra-services:
+        description: 'Services adicionais (ex: workers)'
+        required: false
+        default: ''
+        type: string
+      runner:
+        description: 'GitHub Actions runner'
+        required: false
+        default: blacksmith-4vcpu-ubuntu-2404
+        type: string
+    secrets:
+      SSH_PRIVATE_KEY:
+        required: true
+      GHCR_PULL_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  rollback:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ inputs.vps-host }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Restore image tag on VPS
+        env:
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+          GH_OWNER: ${{ github.repository_owner }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          SERVICE: ${{ inputs.service-name }}
+          VPS_PATH: ${{ inputs.vps-path }}
+          VPS_HOST: ${{ inputs.vps-host }}
+          VPS_USER: ${{ inputs.vps-user }}
+          HEALTH_PATH: ${{ inputs.health-path }}
+          DEFAULT_PORT: ${{ inputs.default-port }}
+          EXTRA_SERVICES: ${{ inputs.extra-services }}
+        run: |
+          IMAGE_LOWER="$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')"
+          echo "Rolling back to $IMAGE_LOWER:$TAG"
+
+          ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" \
+            IMAGE="$IMAGE_LOWER" TAG="$TAG" SERVICE="$SERVICE" \
+            VPS_PATH="$VPS_PATH" HEALTH_PATH="$HEALTH_PATH" \
+            DEFAULT_PORT="$DEFAULT_PORT" EXTRA_SERVICES="$EXTRA_SERVICES" \
+            GHCR_PULL_TOKEN="$GHCR_PULL_TOKEN" GH_OWNER="$GH_OWNER" \
+            'bash -euo pipefail -s' << 'REMOTE'
+            cd "$VPS_PATH"
+
+            echo "$GHCR_PULL_TOKEN" | docker login ghcr.io -u "$GH_OWNER" --password-stdin
+
+            export IMAGE_TAG="$TAG"
+            grep -v "^IMAGE_TAG=" .env > .env.new || true
+            echo "IMAGE_TAG=$IMAGE_TAG" >> .env.new
+            mv .env.new .env
+
+            ALL_SERVICES="$SERVICE $EXTRA_SERVICES"
+            docker compose pull $ALL_SERVICES
+            docker compose up -d --no-build $ALL_SERVICES
+
+            PORT=$(grep "^PORT=" .env | cut -d= -f2 | head -1)
+            PORT=${PORT:-$DEFAULT_PORT}
+            for i in $(seq 1 30); do
+              if curl -fsS "http://localhost:$PORT$HEALTH_PATH" > /dev/null 2>&1; then
+                echo "OK Rollback to $TAG"
+                docker logout ghcr.io
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "FAIL Health pos-rollback — investigar manual"
+            docker logout ghcr.io
+            exit 1
+          REMOTE
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Rollback ${{ job.status }} (${{ inputs.service-name }})" >> $GITHUB_STEP_SUMMARY
+          echo "Tag restaurado: \`${{ inputs.tag }}\`" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,214 @@
+name: Deploy via SSH (reusable)
+
+# Reusable workflow que deploya imagem via SSH no VPS GameHunter.
+# Substitui copia (~140 LoC) em backend, frontend, admin (3 x ~140 = 420 LoC
+# duplicados reduzidos a este unico arquivo).
+#
+# Trigger no consumer: workflow_run de "Build & push image" (auto on tag)
+# OU workflow_dispatch (manual com tag input).
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: 'Service name (backend / frontend / admin)'
+        required: true
+        type: string
+      vps-path:
+        description: 'Path absoluto no VPS (ex: /opt/gamehunter-backend)'
+        required: true
+        type: string
+      vps-host:
+        description: 'VPS host (default IP do GameHunter)'
+        required: false
+        default: '82.29.59.75'
+        type: string
+      vps-user:
+        description: 'SSH user'
+        required: false
+        default: root
+        type: string
+      health-path:
+        description: 'Health check endpoint (default /health)'
+        required: false
+        default: /health
+        type: string
+      default-port:
+        description: 'Default port pra health check (override por .env PORT)'
+        required: false
+        default: '3001'
+        type: string
+      extra-services:
+        description: 'Services adicionais pra restart (ex: workers)'
+        required: false
+        default: ''
+        type: string
+      migration-cmd:
+        description: 'Comando de migration (executado antes do up). Ex: npm run migrate. Vazio = pula.'
+        required: false
+        default: ''
+        type: string
+      purge-cf:
+        description: 'Purgar Cloudflare cache full apos deploy ok'
+        required: false
+        default: true
+        type: boolean
+      runner:
+        description: 'GitHub Actions runner label'
+        required: false
+        default: blacksmith-4vcpu-ubuntu-2404
+        type: string
+      tag:
+        description: 'Tag pra deployar (passa do workflow_dispatch input do stub; vazio = pega do workflow_run)'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      SSH_PRIVATE_KEY:
+        required: true
+      GHCR_PULL_TOKEN:
+        required: true
+      REVALIDATE_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          if [[ ! "$TAG" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|sha-[0-9a-f]{7})$ ]]; then
+            echo "::error::Tag '$TAG' nao e semver (vX.Y.Z) nem sha-XXXXXXX"
+            exit 1
+          fi
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            git fetch --force --tags origin main:refs/remotes/origin/main
+            TAG_SHA="$(git rev-list -n 1 "$TAG")"
+            if ! git merge-base --is-ancestor "$TAG_SHA" origin/main; then
+              echo "::error::Release tag $TAG ($TAG_SHA) is not reachable from origin/main."
+              exit 1
+            fi
+          fi
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ inputs.vps-host }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Pull image and restart on VPS
+        env:
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+          GH_OWNER: ${{ github.repository_owner }}
+          IMAGE: ${{ steps.tag.outputs.image }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          SERVICE: ${{ inputs.service-name }}
+          VPS_PATH: ${{ inputs.vps-path }}
+          VPS_HOST: ${{ inputs.vps-host }}
+          VPS_USER: ${{ inputs.vps-user }}
+          HEALTH_PATH: ${{ inputs.health-path }}
+          DEFAULT_PORT: ${{ inputs.default-port }}
+          EXTRA_SERVICES: ${{ inputs.extra-services }}
+          MIGRATION_CMD: ${{ inputs.migration-cmd }}
+        run: |
+          ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" \
+            IMAGE="$IMAGE" TAG="$TAG" SERVICE="$SERVICE" \
+            VPS_PATH="$VPS_PATH" HEALTH_PATH="$HEALTH_PATH" \
+            DEFAULT_PORT="$DEFAULT_PORT" EXTRA_SERVICES="$EXTRA_SERVICES" \
+            MIGRATION_CMD="$MIGRATION_CMD" \
+            GHCR_PULL_TOKEN="$GHCR_PULL_TOKEN" GH_OWNER="$GH_OWNER" \
+            'bash -euo pipefail -s' << 'REMOTE'
+            cd "$VPS_PATH"
+
+            git fetch origin main
+            git reset --hard origin/main
+
+            echo "$GHCR_PULL_TOKEN" | docker login ghcr.io -u "$GH_OWNER" --password-stdin
+
+            CURRENT=$(docker compose images "$SERVICE" --quiet 2>/dev/null || true)
+            if [ -n "$CURRENT" ]; then
+              docker tag "$CURRENT" "$IMAGE:rollback" || true
+            fi
+
+            export IMAGE_TAG="$TAG"
+            grep -v "^IMAGE_TAG=" .env > .env.new || true
+            echo "IMAGE_TAG=$IMAGE_TAG" >> .env.new
+            mv .env.new .env
+
+            ALL_SERVICES="$SERVICE $EXTRA_SERVICES"
+            docker compose pull $ALL_SERVICES
+
+            if [ -n "$MIGRATION_CMD" ]; then
+              docker compose run -T --rm --no-deps "$SERVICE" $MIGRATION_CMD < /dev/null
+            fi
+
+            docker compose up -d --no-build --force-recreate $ALL_SERVICES
+
+            PORT=$(grep "^PORT=" .env | cut -d= -f2 | head -1)
+            PORT=${PORT:-$DEFAULT_PORT}
+            echo "Health check em localhost:$PORT$HEALTH_PATH"
+            for i in $(seq 1 30); do
+              if curl -fsS "http://localhost:$PORT$HEALTH_PATH" > /dev/null 2>&1; then
+                echo "OK $SERVICE healthy on tag $IMAGE_TAG"
+                docker logout ghcr.io
+                exit 0
+              fi
+              sleep 2
+            done
+
+            echo "FAIL: Health check failed after 60s — auto-rolling back"
+            export IMAGE_TAG=rollback
+            grep -v "^IMAGE_TAG=" .env > .env.new || true
+            echo "IMAGE_TAG=$IMAGE_TAG" >> .env.new
+            mv .env.new .env
+            docker compose up -d --no-build --force-recreate $ALL_SERVICES
+            docker logout ghcr.io
+            exit 1
+          REMOTE
+
+      - name: Purge Cloudflare cache (full)
+        if: success() && inputs.purge-cf
+        env:
+          REVALIDATE_TOKEN: ${{ secrets.REVALIDATE_TOKEN }}
+        run: |
+          if [ -z "$REVALIDATE_TOKEN" ]; then
+            echo "Aviso: REVALIDATE_TOKEN nao configurado, pulando CF purge"
+            exit 0
+          fi
+          curl -fsS -X POST https://gamehunter.com.br/ops/purge \
+            -H "Authorization: Bearer $REVALIDATE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"purge_everything":true}'
+          echo "OK CF purge via Worker"
+
+      - name: Notify summary
+        if: always()
+        run: |
+          echo "## Deploy ${{ job.status }} (${{ inputs.service-name }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: \`${{ steps.tag.outputs.image }}:${{ steps.tag.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- VPS: ${{ inputs.vps-host }} (${{ inputs.vps-path }})" >> $GITHUB_STEP_SUMMARY
+          echo "- Service(s): ${{ inputs.service-name }} ${{ inputs.extra-services }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Health: localhost:${{ inputs.default-port }}${{ inputs.health-path }}" >> $GITHUB_STEP_SUMMARY
