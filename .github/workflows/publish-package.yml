@@ -51,16 +51,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Require release tag on main
         if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          git fetch --force origin main:refs/remotes/origin/main
-          TAG_SHA="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
-          if ! git merge-base --is-ancestor "$TAG_SHA" origin/main; then
-            echo "::error::Release tag ${GITHUB_REF_NAME} (${TAG_SHA}) is not reachable from origin/main. Merge it to main before publishing."
+          # GH compare API: 'identical' = TAG == main HEAD; 'behind' = TAG eh
+          # ancestor de main. Substitui git fetch + merge-base (~5-8s -> ~1s,
+          # elimina necessidade de fetch-depth: 0).
+          STATUS=$(gh api "/repos/${GITHUB_REPOSITORY}/compare/main...${GITHUB_SHA}" --jq '.status')
+          if [[ "$STATUS" != "behind" && "$STATUS" != "identical" ]]; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not reachable from origin/main (compare status: $STATUS). Merge it to main before publishing."
             exit 1
           fi
 

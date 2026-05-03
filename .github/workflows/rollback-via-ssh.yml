@@ -56,6 +56,12 @@ on:
 permissions:
   contents: read
 
+# Compartilha grupo com deploy-via-ssh.yml pra evitar race entre rollback e
+# deploy concorrente (ambos modificam o estado do VPS).
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   rollback:
     runs-on: ${{ inputs.runner }}

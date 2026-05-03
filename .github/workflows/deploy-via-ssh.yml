@@ -79,10 +79,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Compute image tag
         id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
@@ -96,10 +98,12 @@ jobs:
             exit 1
           fi
           if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            git fetch --force --tags origin main:refs/remotes/origin/main
-            TAG_SHA="$(git rev-list -n 1 "$TAG")"
-            if ! git merge-base --is-ancestor "$TAG_SHA" origin/main; then
-              echo "::error::Release tag $TAG ($TAG_SHA) is not reachable from origin/main."
+            # GH compare API: 'identical' = TAG == main HEAD; 'behind' = TAG eh
+            # ancestor de main. Substitui git fetch --tags + git rev-list +
+            # merge-base (~5-8s -> ~1s, elimina necessidade de fetch-depth: 0).
+            STATUS=$(gh api "/repos/${GITHUB_REPOSITORY}/compare/main...${TAG}" --jq '.status' 2>/dev/null || echo "error")
+            if [[ "$STATUS" != "behind" && "$STATUS" != "identical" ]]; then
+              echo "::error::Release tag $TAG is not reachable from origin/main (compare status: $STATUS)."
               exit 1
             fi
           fi
