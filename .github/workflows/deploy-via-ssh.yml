@@ -77,7 +77,7 @@ jobs:
   deploy:
     runs-on: ${{ inputs.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
@@ -103,7 +103,7 @@ jobs:
             # merge-base (~5-8s -> ~1s, elimina necessidade de fetch-depth: 0).
             STATUS=$(gh api "/repos/${GITHUB_REPOSITORY}/compare/main...${TAG}" --jq '.status' 2>/dev/null || echo "error")
             if [[ "$STATUS" != "behind" && "$STATUS" != "identical" ]]; then
-              echo "::error::Release tag $TAG is not reachable from origin/main (compare status: $STATUS)."
+              echo "::error::Release tag $TAG is not reachable from origin/main (compare status: $STATUS). Merge this commit to main, then recreate or promote the tag from main."
               exit 1
             fi
           fi
