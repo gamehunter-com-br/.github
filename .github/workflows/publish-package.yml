@@ -49,7 +49,7 @@ jobs:
   publish:
     runs-on: ${{ inputs.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
@@ -64,31 +64,61 @@ jobs:
           # elimina necessidade de fetch-depth: 0).
           STATUS=$(gh api "/repos/${GITHUB_REPOSITORY}/compare/main...${GITHUB_SHA}" --jq '.status')
           if [[ "$STATUS" != "behind" && "$STATUS" != "identical" ]]; then
-            echo "::error::Release tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not reachable from origin/main (compare status: $STATUS). Merge it to main before publishing."
+            echo "::error::Release tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not reachable from origin/main (compare status: $STATUS). Merge this commit to main, then recreate or promote the tag from main."
             exit 1
           fi
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
           registry-url: 'https://npm.pkg.github.com'
           scope: '@gamehunter-com-br'
           cache: npm
 
+      - name: Read package metadata
+        id: package
+        run: |
+          set -euo pipefail
+          node -e "const p=require('./package.json'); if(!p.name||!p.version) throw new Error('package.json must define name and version'); console.log('name='+p.name); console.log('version='+p.version)" >> "$GITHUB_OUTPUT"
+
+      - name: Check package version availability
+        id: publish-check
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PKG="${{ steps.package.outputs.name }}"
+          VERSION="${{ steps.package.outputs.version }}"
+          if npm view "${PKG}@${VERSION}" version --registry=https://npm.pkg.github.com >/dev/null 2>&1; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${PKG}@${VERSION} already exists in GitHub Packages; skipping build and publish."
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install deps (cross-repo)
-        if: ${{ inputs.needs-cross-repo-deps }}
+        if: ${{ inputs.needs-cross-repo-deps && steps.publish-check.outputs.already_published != 'true' }}
         run: npm ci
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_PACKAGES_READ_TOKEN }}
 
       - name: Install deps (no cross-repo)
-        if: ${{ !inputs.needs-cross-repo-deps }}
+        if: ${{ !inputs.needs-cross-repo-deps && steps.publish-check.outputs.already_published != 'true' }}
         run: npm ci
 
       - name: Build
+        if: steps.publish-check.outputs.already_published != 'true'
         run: ${{ inputs.build-command }}
 
       - name: Publish
+        if: steps.publish-check.outputs.already_published != 'true'
         run: ${{ inputs.publish-command }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        if: steps.publish-check.outputs.already_published == 'true'
+        run: |
+          echo "## Publish skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ steps.package.outputs.name }}@${{ steps.package.outputs.version }}\` already exists in GitHub Packages." >> "$GITHUB_STEP_SUMMARY"

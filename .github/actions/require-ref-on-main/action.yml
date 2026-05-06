@@ -18,6 +18,6 @@ runs:
         set -euo pipefail
         git fetch --force "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main:refs/remotes/origin/main
         if ! git merge-base --is-ancestor HEAD origin/main; then
-          echo "::error::Ref ${GITHUB_REF_NAME} is not reachable from origin/main. Merge it to main before tagging or deploying."
+          echo "::error::Ref ${GITHUB_REF_NAME} is not reachable from origin/main. Merge this commit to main, then recreate or promote the release tag from main."
           exit 1
         fi
