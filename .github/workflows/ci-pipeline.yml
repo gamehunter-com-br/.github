@@ -152,13 +152,16 @@ jobs:
         shell: bash
         run: ${{ inputs.extra_steps_after_install }}
 
+      # Pra npm scripts customizados é sempre `npm run <script>`. Pra pnpm,
+      # `pnpm <script>` resolve via pnpm script-runner. Default usa o prefix
+      # apropriado por package manager; inputs.<X>_command sobrescrevem.
       - name: Lint
         if: inputs.run_lint
-        run: ${{ inputs.lint_command != '' && inputs.lint_command || format('{0} lint', inputs.package_manager) }}
+        run: ${{ inputs.lint_command != '' && inputs.lint_command || format('{0} run lint', inputs.package_manager) }}
 
       - name: Type check
         if: inputs.run_typecheck
-        run: ${{ inputs.typecheck_command != '' && inputs.typecheck_command || format('{0} typecheck', inputs.package_manager) }}
+        run: ${{ inputs.typecheck_command != '' && inputs.typecheck_command || format('{0} run typecheck', inputs.package_manager) }}
 
       - name: Test
         if: inputs.run_test
@@ -166,7 +169,7 @@ jobs:
 
       - name: Build
         if: inputs.run_build
-        run: ${{ inputs.build_command != '' && inputs.build_command || format('{0} build', inputs.package_manager) }}
+        run: ${{ inputs.build_command != '' && inputs.build_command || format('{0} run build', inputs.package_manager) }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_PACKAGES_READ_TOKEN || secrets.GITHUB_TOKEN }}
 
