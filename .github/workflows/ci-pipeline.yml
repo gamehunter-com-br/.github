@@ -1,0 +1,176 @@
+name: CI Pipeline (reusable)
+
+# Reusable workflow para CI básico (lint + typecheck + test + build).
+# Consumido pelos 8 repos do ecossistema GameHunter via:
+#   uses: gamehunter-com-br/.github/.github/workflows/ci-pipeline.yml@v1
+#
+# Substitui ~50-80 LOC inline por repo de stub ~12 LOC. Ganho médio
+# estimado: 35-60 LOC por repo (8 repos × ~45 = ~360 LOC removidas).
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: 'GitHub Actions runner label'
+        required: false
+        default: blacksmith-4vcpu-ubuntu-2404
+        type: string
+      package_manager:
+        description: 'npm or pnpm'
+        required: false
+        default: pnpm
+        type: string
+      node_version:
+        description: 'Node major version'
+        required: false
+        default: '22'
+        type: string
+      lockfile_path:
+        description: 'Lockfile path for cache key (pnpm-lock.yaml ou package-lock.json).'
+        required: false
+        default: ''
+        type: string
+      cache_paths:
+        description: 'Paths extras pra actions/cache (multi-line).'
+        required: false
+        default: |
+          node_modules
+        type: string
+      run_lint:
+        description: 'Rodar lint script'
+        required: false
+        default: false
+        type: boolean
+      lint_command:
+        description: 'Comando lint (default: <pm> lint)'
+        required: false
+        default: ''
+        type: string
+      run_typecheck:
+        description: 'Rodar typecheck'
+        required: false
+        default: true
+        type: boolean
+      typecheck_command:
+        description: 'Comando typecheck (default: <pm> typecheck)'
+        required: false
+        default: ''
+        type: string
+      run_test:
+        description: 'Rodar test suite'
+        required: false
+        default: true
+        type: boolean
+      test_command:
+        description: 'Comando test (default: <pm> test)'
+        required: false
+        default: ''
+        type: string
+      run_build:
+        description: 'Rodar build'
+        required: false
+        default: false
+        type: boolean
+      build_command:
+        description: 'Comando build (default: <pm> build)'
+        required: false
+        default: ''
+        type: string
+      build_env:
+        description: 'Env vars extras pro build (multi-line KEY=VALUE).'
+        required: false
+        default: ''
+        type: string
+      extra_steps_after_install:
+        description: 'Shell script pra rodar logo após install (antes de lint/typecheck/test/build). Multi-line OK.'
+        required: false
+        default: ''
+        type: string
+      extra_steps_after_build:
+        description: 'Shell script pra rodar após build (ex: anti-leakage scan no frontend).'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      NPM_PACKAGES_READ_TOKEN:
+        description: 'PAT com read:packages pra cross-repo deps. Fallback pra GITHUB_TOKEN.'
+        required: false
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pipeline:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # Setup Node + package manager. pnpm e npm têm reusable actions diferentes.
+      - name: Setup Node + pnpm
+        if: inputs.package_manager == 'pnpm'
+        uses: gamehunter-com-br/.github/.github/actions/setup-node-pnpm@v1
+
+      - name: Setup Node + npm
+        if: inputs.package_manager == 'npm'
+        uses: gamehunter-com-br/.github/.github/actions/setup-node-npm@v1
+
+      # Cache complementar ao pnpm store / npm cache do setup-node.
+      - name: Compute lockfile path
+        id: lockfile
+        run: |
+          if [[ -n "${{ inputs.lockfile_path }}" ]]; then
+            echo "path=${{ inputs.lockfile_path }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ inputs.package_manager }}" == "pnpm" ]]; then
+            echo "path=pnpm-lock.yaml" >> $GITHUB_OUTPUT
+          else
+            echo "path=package-lock.json" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Cache node_modules
+        uses: actions/cache@v5
+        with:
+          path: ${{ inputs.cache_paths }}
+          key: ${{ runner.os }}-${{ inputs.package_manager }}-${{ hashFiles(steps.lockfile.outputs.path) }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.package_manager }}-
+
+      - name: Install dependencies (pnpm)
+        if: inputs.package_manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_PACKAGES_READ_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies (npm)
+        if: inputs.package_manager == 'npm'
+        run: npm ci
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_PACKAGES_READ_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Extra steps after install
+        if: inputs.extra_steps_after_install != ''
+        shell: bash
+        run: ${{ inputs.extra_steps_after_install }}
+
+      - name: Lint
+        if: inputs.run_lint
+        run: ${{ inputs.lint_command != '' && inputs.lint_command || format('{0} lint', inputs.package_manager) }}
+
+      - name: Type check
+        if: inputs.run_typecheck
+        run: ${{ inputs.typecheck_command != '' && inputs.typecheck_command || format('{0} typecheck', inputs.package_manager) }}
+
+      - name: Test
+        if: inputs.run_test
+        run: ${{ inputs.test_command != '' && inputs.test_command || format('{0} test', inputs.package_manager) }}
+
+      - name: Build
+        if: inputs.run_build
+        run: ${{ inputs.build_command != '' && inputs.build_command || format('{0} build', inputs.package_manager) }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_PACKAGES_READ_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Extra steps after build
+        if: inputs.extra_steps_after_build != ''
+        shell: bash
+        run: ${{ inputs.extra_steps_after_build }}
