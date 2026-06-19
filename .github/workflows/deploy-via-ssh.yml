@@ -155,24 +155,44 @@ jobs:
             docker compose pull \$ALL_SERVICES
 
             if [ -n "$MIGRATION_CMD" ]; then
-              docker compose run -T --rm --no-deps "$SERVICE" $MIGRATION_CMD < /dev/null
+              if [ -n "$EXTRA_SERVICES" ]; then
+                echo "Pausing extra services before migration: $EXTRA_SERVICES"
+                docker compose stop $EXTRA_SERVICES || true
+              fi
+
+              echo "Running migration with PostgreSQL lock/statement guard"
+              if ! timeout 180s docker compose run -T --rm --no-deps \
+                -e PGOPTIONS="-c lock_timeout=3000 -c statement_timeout=120000 -c idle_in_transaction_session_timeout=120000 -c application_name=gamehunter-migrate" \
+                "$SERVICE" $MIGRATION_CMD < /dev/null; then
+                echo "FAIL: Migration failed or timed out — restoring rollback image"
+                export IMAGE_TAG=rollback
+                grep -v "^IMAGE_TAG=" .env > .env.new || true
+                echo "IMAGE_TAG=\$IMAGE_TAG" >> .env.new
+                mv .env.new .env
+                docker compose up -d --no-build --force-recreate \$ALL_SERVICES
+                docker logout ghcr.io
+                exit 1
+              fi
             fi
 
-            docker compose up -d --no-build --force-recreate \$ALL_SERVICES
+            docker compose up -d --no-build --force-recreate "$SERVICE"
 
             PORT=\$(grep "^PORT=" .env | cut -d= -f2 | head -1)
             PORT=\${PORT:-$DEFAULT_PORT}
             echo "Health check em localhost:\$PORT$HEALTH_PATH"
-            for i in \$(seq 1 30); do
+            for i in \$(seq 1 45); do
               if curl -fsS "http://localhost:\$PORT$HEALTH_PATH" > /dev/null 2>&1; then
                 echo "OK $SERVICE healthy on tag \$IMAGE_TAG"
+                if [ -n "$EXTRA_SERVICES" ]; then
+                  docker compose up -d --no-build --force-recreate $EXTRA_SERVICES
+                fi
                 docker logout ghcr.io
                 exit 0
               fi
               sleep 2
             done
 
-            echo "FAIL: Health check failed after 60s — auto-rolling back"
+            echo "FAIL: Health check failed after 90s — auto-rolling back"
             export IMAGE_TAG=rollback
             grep -v "^IMAGE_TAG=" .env > .env.new || true
             echo "IMAGE_TAG=\$IMAGE_TAG" >> .env.new
