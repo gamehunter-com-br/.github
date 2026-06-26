@@ -38,6 +38,21 @@ on:
         required: false
         default: ''
         type: string
+      deploy-workers:
+        description: 'auto, true ou false; controla restart do service workers'
+        required: false
+        default: auto
+        type: string
+      worker-drain-enabled:
+        description: 'Executa drain deploy-safe antes de reiniciar workers'
+        required: false
+        default: 'true'
+        type: string
+      worker-drain-timeout-minutes:
+        description: 'Timeout do drain dos workers'
+        required: false
+        default: '15'
+        type: string
       migration-cmd:
         description: 'Comando de migration (ex: npm run migrate). Vazio pula.'
         required: false
@@ -79,7 +94,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Compute image tag
         id: tag
@@ -110,6 +125,56 @@ jobs:
           echo "image=${IMAGE}" >> $GITHUB_OUTPUT
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
 
+      - name: Resolve worker deploy mode
+        id: worker-mode
+        env:
+          SERVICE: ${{ inputs.service-name }}
+          DEPLOY_WORKERS_INPUT: ${{ inputs.deploy-workers }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          MODE="${DEPLOY_WORKERS_INPUT:-auto}"
+          REASON="manual override"
+          CHANGED_FILES=""
+
+          if [ "$SERVICE" = "backend" ] && [ "$MODE" = "auto" ]; then
+            git fetch --tags --force origin '+refs/tags/*:refs/tags/*' >/dev/null 2>&1 || true
+            if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              PREV_TAG=$(git tag --sort=-v:refname 'v*.*.*' | awk -v current="$TAG" '$0 != current { print; exit }')
+              if [ -n "$PREV_TAG" ] && git rev-parse -q --verify "$PREV_TAG^{commit}" >/dev/null && git rev-parse -q --verify "$TAG^{commit}" >/dev/null; then
+                CHANGED_FILES=$(git diff --name-only "$PREV_TAG" "$TAG")
+                REASON="auto compare $PREV_TAG..$TAG"
+              else
+                CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD)
+                REASON="auto fallback HEAD tree"
+              fi
+            else
+              CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD)
+              REASON="auto sha fallback HEAD tree"
+            fi
+
+            if printf '%s\n' "$CHANGED_FILES" | grep -Eq '^(src/(queue|workers|services/jobs|db)/|src/services/(admin/job-runs|job-ledger-cleanup)\.js|scripts/deploy-|docker-compose\.yml|package\.json|pnpm-lock\.yaml|\.github/workflows/(build-image|deploy)\.yml)'; then
+              MODE=true
+            else
+              MODE=false
+            fi
+          fi
+
+          if [[ "$MODE" != "auto" && "$MODE" != "true" && "$MODE" != "false" ]]; then
+            echo "::error::deploy-workers precisa ser auto, true ou false (recebido: $MODE)"
+            exit 1
+          fi
+
+          {
+            echo "mode=$MODE"
+            echo "reason=$REASON"
+            echo "changed<<EOF_CHANGED"
+            printf '%s\n' "$CHANGED_FILES"
+            echo "EOF_CHANGED"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "deploy-workers resolved: $MODE ($REASON)"
+
       - name: Set up SSH
         run: |
           mkdir -p ~/.ssh
@@ -128,6 +193,10 @@ jobs:
           HEALTH_PATH: ${{ inputs.health-path }}
           DEFAULT_PORT: ${{ inputs.default-port }}
           EXTRA_SERVICES: ${{ inputs.extra-services }}
+          DEPLOY_WORKERS: ${{ steps.worker-mode.outputs.mode }}
+          WORKER_DRAIN_ENABLED: ${{ inputs.worker-drain-enabled }}
+          WORKER_DRAIN_TIMEOUT_MINUTES: ${{ inputs.worker-drain-timeout-minutes }}
+          DEPLOY_RUN_ID: ${{ github.run_id }}
           MIGRATION_CMD: ${{ inputs.migration-cmd }}
           GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
           GH_OWNER: ${{ github.repository_owner }}
@@ -151,11 +220,69 @@ jobs:
             echo "IMAGE_TAG=\$IMAGE_TAG" >> .env.new
             mv .env.new .env
 
-            ALL_SERVICES="$SERVICE $EXTRA_SERVICES"
+            EXTRA_SERVICES_EFFECTIVE="$EXTRA_SERVICES"
+            if [ "$SERVICE" = "backend" ]; then
+              case "$DEPLOY_WORKERS" in
+                false)
+                  EXTRA_SERVICES_EFFECTIVE=\$(printf '%s\n' "$EXTRA_SERVICES" | tr ' ' '\n' | grep -v '^workers$' | xargs || true)
+                  ;;
+                true)
+                  if ! printf ' %s ' "\$EXTRA_SERVICES_EFFECTIVE" | grep -q ' workers '; then
+                    EXTRA_SERVICES_EFFECTIVE="\${EXTRA_SERVICES_EFFECTIVE:+\$EXTRA_SERVICES_EFFECTIVE }workers"
+                  fi
+                  ;;
+                auto|'')
+                  ;;
+                *)
+                  echo "FAIL: deploy-workers precisa ser auto, true ou false (recebido: $DEPLOY_WORKERS)"
+                  exit 1
+                  ;;
+              esac
+            fi
+
+            ALL_SERVICES="$SERVICE \$EXTRA_SERVICES_EFFECTIVE"
             docker compose pull \$ALL_SERVICES
 
             if [ -n "$MIGRATION_CMD" ]; then
               docker compose run -T --rm --no-deps "$SERVICE" $MIGRATION_CMD < /dev/null
+            fi
+
+            WORKER_DRAIN_ID=""
+            resume_worker_queue() {
+              if [ -n "\$WORKER_DRAIN_ID" ]; then
+                local reason="\${1:-deploy workflow finalizer}"
+                local strict="\${2:-false}"
+                if docker compose run -T --rm --no-deps "$SERVICE" npm run deploy:workers:resume -- \
+                  --drain-id "\$WORKER_DRAIN_ID" \
+                  --reason "\$reason" \
+                  --json < /dev/null; then
+                  WORKER_DRAIN_ID=""
+                elif [ "\$strict" = "true" ]; then
+                  return 1
+                fi
+              fi
+            }
+            trap 'status=\$?; if [ \$status -ne 0 ]; then resume_worker_queue "deploy workflow failed before completion"; fi; exit \$status' EXIT
+
+            SHOULD_DRAIN_WORKERS=false
+            if [ "$WORKER_DRAIN_ENABLED" = "true" ] && printf ' %s ' "\$ALL_SERVICES" | grep -q ' workers '; then
+              SHOULD_DRAIN_WORKERS=true
+            fi
+            if [ "\$SHOULD_DRAIN_WORKERS" = "true" ]; then
+              WORKER_DRAIN_TIMEOUT_MS=\$(( ${WORKER_DRAIN_TIMEOUT_MINUTES:-15} * 60 * 1000 ))
+              echo "Deploy-safe worker drain: timeout=\${WORKER_DRAIN_TIMEOUT_MS}ms"
+              DRAIN_OUTPUT=\$(docker compose run -T --rm --no-deps "$SERVICE" npm run deploy:workers:drain -- \
+                --deploy-ref "$DEPLOY_RUN_ID" \
+                --image-tag "$TAG" \
+                --timeout-ms "\$WORKER_DRAIN_TIMEOUT_MS" \
+                --source github_actions \
+                --json < /dev/null)
+              echo "\$DRAIN_OUTPUT"
+              WORKER_DRAIN_ID=\$(printf '%s\n' "\$DRAIN_OUTPUT" | tail -n 1 | sed -n 's/.*"drain_id":"\([^"]*\)".*/\1/p')
+              if [ -z "\$WORKER_DRAIN_ID" ]; then
+                echo "FAIL: drain liberou deploy sem drain_id parseavel"
+                exit 1
+              fi
             fi
 
             docker compose up -d --no-build --force-recreate \$ALL_SERVICES
@@ -166,6 +293,7 @@ jobs:
             for i in \$(seq 1 30); do
               if curl -fsS "http://localhost:\$PORT$HEALTH_PATH" > /dev/null 2>&1; then
                 echo "OK $SERVICE healthy on tag \$IMAGE_TAG"
+                resume_worker_queue "deploy healthy: $TAG" true
                 docker logout ghcr.io
                 exit 0
               fi
@@ -178,6 +306,7 @@ jobs:
             echo "IMAGE_TAG=\$IMAGE_TAG" >> .env.new
             mv .env.new .env
             docker compose up -d --no-build --force-recreate \$ALL_SERVICES
+            resume_worker_queue "deploy health failed after rollback"
             docker logout ghcr.io
             exit 1
           EOF
@@ -205,4 +334,5 @@ jobs:
           echo "- Image: \`${{ steps.tag.outputs.image }}:${{ steps.tag.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- VPS: ${{ inputs.vps-host }} (${{ inputs.vps-path }})" >> $GITHUB_STEP_SUMMARY
           echo "- Service(s): ${{ inputs.service-name }} ${{ inputs.extra-services }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Deploy workers: ${{ steps.worker-mode.outputs.mode }} (${{ steps.worker-mode.outputs.reason }}); drain: ${{ inputs.worker-drain-enabled }} (${{ inputs.worker-drain-timeout-minutes }} min)" >> $GITHUB_STEP_SUMMARY
           echo "- Health: localhost:${{ inputs.default-port }}${{ inputs.health-path }}" >> $GITHUB_STEP_SUMMARY
