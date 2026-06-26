@@ -99,6 +99,31 @@ jobs:
 > caller. Sem o block `permissions:` na stub, o run falha com
 > `startup_failure` (não chega nem ao step de `npm publish`).
 
+### `.github/workflows/deploy-via-ssh.yml`
+
+Deploya uma imagem GHCR no VPS via Docker Compose.
+
+**Inputs F3-77 para workers:**
+
+- `extra-services` (string, default `''`) - services adicionais no compose, ex.: `workers`.
+- `deploy-workers` (string, default `auto`) - `auto`, `true` ou `false`. Em `false`, remove `workers` da lista
+  efetiva; em `true`, adiciona `workers` para backend. Em `auto`, o reusable compara o tag atual com o tag semver
+  anterior e so reinicia `workers` quando mudam paths de runtime de jobs/workers: `src/queue/`, `src/workers/`,
+  `src/services/jobs/`, `src/services/admin/job-runs.js`, `src/services/job-ledger-cleanup.js`, `src/db/`,
+  `scripts/deploy-*`, `docker-compose.yml`, lock/package ou os workflows de deploy/build.
+- `worker-drain-enabled` (string, default `'true'`) - quando `true` e `workers` esta na lista efetiva, roda
+  `npm run deploy:workers:drain` antes do restart.
+- `worker-drain-timeout-minutes` (string, default `'15'`) - timeout do drain.
+
+O drain roda depois da migration do backend, usando a nova imagem ja pullada, e antes de `docker compose up` recriar
+`workers`. Em sucesso de health, o workflow chama `npm run deploy:workers:resume`; em rollback/falha, o trap tenta
+retomar a fila em best-effort. Exit codes do drain: `0` libera, `20` bloqueia por politica, `21` timeout, `22` estado
+inseguro e `1` erro tecnico.
+
+Use override `deploy-workers=true` quando a release docs/API-only ainda precisa reiniciar workers por operacao manual.
+Use `deploy-workers=false` quando a mudanca de backend nao toca runtime dos workers e o diff automatico for
+conservador demais.
+
 ## Política de versionamento
 
 - Reusable workflows são pinned por **tag semver** (`@v1`) em produção, ou por
