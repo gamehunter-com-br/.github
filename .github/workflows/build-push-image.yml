@@ -31,6 +31,9 @@ on:
       NPM_PACKAGES_READ_TOKEN:
         description: 'PAT com read:packages pra cross-repo deps. Fallback pra GITHUB_TOKEN.'
         required: false
+      SENTRY_AUTH_TOKEN:
+        description: 'Sentry auth token (project:releases) pra upload de sourcemaps no build. Opcional; vazio = sem upload (withSentryConfig fica silent, build segue verde).'
+        required: false
 
 permissions:
   contents: read
@@ -133,6 +136,7 @@ jobs:
           cache-to: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache,mode=max
           build-args: |
             NODE_AUTH_TOKEN=${{ secrets.NPM_PACKAGES_READ_TOKEN || secrets.GITHUB_TOKEN }}
+            SENTRY_AUTH_TOKEN=${{ secrets.SENTRY_AUTH_TOKEN }}
             ${{ inputs.extra-build-args }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
