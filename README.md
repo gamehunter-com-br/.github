@@ -109,8 +109,9 @@ Deploya uma imagem GHCR no VPS via Docker Compose.
 - `deploy-workers` (string, default `auto`) - `auto`, `true` ou `false`. Em `false`, remove `workers` da lista
   efetiva; em `true`, adiciona `workers` para backend. Em `auto`, o reusable compara o tag atual com o tag semver
   anterior e so reinicia `workers` quando mudam paths de runtime de jobs/workers: `src/queue/`, `src/workers/`,
-  `src/services/jobs/`, `src/services/admin/job-runs.js`, `src/services/job-ledger-cleanup.js`, `src/db/`,
-  `scripts/deploy-*`, `docker-compose.yml`, lock/package ou os workflows de deploy/build.
+  `src/services/jobs/`, `src/services/affiliates/`, `src/services/admin/job-runs.js`,
+  `src/services/job-ledger-cleanup.js`, `src/db/`, `scripts/deploy-*`, `docker-compose.yml`, lock/package ou os
+  workflows de deploy/build.
 - `worker-drain-enabled` (string, default `'true'`) - quando `true` e `workers` esta na lista efetiva, roda
   `npm run deploy:workers:drain` antes do restart.
 - `worker-drain-timeout-minutes` (string, default `'15'`) - timeout do drain.

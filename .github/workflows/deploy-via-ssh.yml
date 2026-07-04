@@ -160,7 +160,7 @@ jobs:
               REASON="auto sha fallback HEAD tree"
             fi
 
-            WORKER_DEPLOY_RE='^(src/(queue|workers|services/jobs|db)/|src/services/(admin/job-runs|job-ledger-cleanup)\.js|scripts/deploy-|docker-compose\.yml|package\.json|pnpm-lock\.yaml|\.github/workflows/(build-image|deploy)\.yml)'
+            WORKER_DEPLOY_RE='^(src/(queue|workers|services/jobs|services/affiliates|db)/|src/services/(admin/job-runs|job-ledger-cleanup)\.js|scripts/deploy-|docker-compose\.yml|package\.json|pnpm-lock\.yaml|\.github/workflows/(build-image|deploy)\.yml)'
             if grep -Eq "$WORKER_DEPLOY_RE" <<< "$CHANGED_FILES"; then
               MODE=true
             else
