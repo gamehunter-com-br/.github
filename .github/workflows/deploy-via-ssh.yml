@@ -28,6 +28,16 @@ on:
         required: false
         default: /health
         type: string
+      public-readiness-checks:
+        description: 'Espaco-separado host:/path para validar nginx/public upstream; vazio usa defaults por service; "none" pula'
+        required: false
+        default: ''
+        type: string
+      public-readiness-timeout-seconds:
+        description: 'Tempo maximo para readiness publico/nginx depois do health local'
+        required: false
+        default: '90'
+        type: string
       default-port:
         description: 'Default port pra health check'
         required: false
@@ -199,6 +209,8 @@ jobs:
           VPS_HOST: ${{ inputs.vps-host }}
           VPS_USER: ${{ inputs.vps-user }}
           HEALTH_PATH: ${{ inputs.health-path }}
+          PUBLIC_READINESS_CHECKS: ${{ inputs.public-readiness-checks }}
+          PUBLIC_READINESS_TIMEOUT_SECONDS: ${{ inputs.public-readiness-timeout-seconds }}
           DEFAULT_PORT: ${{ inputs.default-port }}
           EXTRA_SERVICES: ${{ inputs.extra-services }}
           DEPLOY_WORKERS: ${{ steps.worker-mode.outputs.mode }}
@@ -300,10 +312,67 @@ jobs:
             echo "Health check em localhost:\$PORT$HEALTH_PATH"
             for i in \$(seq 1 30); do
               if curl -fsS "http://localhost:\$PORT$HEALTH_PATH" > /dev/null 2>&1; then
-                echo "OK $SERVICE healthy on tag \$IMAGE_TAG"
-                resume_worker_queue "deploy healthy: $TAG" true
-                docker logout ghcr.io
-                exit 0
+                echo "OK $SERVICE local health on tag \$IMAGE_TAG"
+
+                PUBLIC_CHECKS="$PUBLIC_READINESS_CHECKS"
+                if [ -z "\$PUBLIC_CHECKS" ]; then
+                  case "$SERVICE" in
+                    backend)
+                      PUBLIC_CHECKS="gamehunter.com.br:/api/health gamehunter.com.br:/api/rpc/health"
+                      ;;
+                    frontend)
+                      PUBLIC_CHECKS="gamehunter.com.br:/"
+                      ;;
+                    admin)
+                      PUBLIC_CHECKS="admin.gamehunter.com.br:/"
+                      ;;
+                    *)
+                      PUBLIC_CHECKS="none"
+                      ;;
+                  esac
+                fi
+
+                if [ "\$PUBLIC_CHECKS" = "none" ]; then
+                  echo "Public readiness skipped"
+                  resume_worker_queue "deploy healthy: $TAG" true
+                  docker logout ghcr.io
+                  exit 0
+                fi
+
+                PUBLIC_TIMEOUT="$PUBLIC_READINESS_TIMEOUT_SECONDS"
+                PUBLIC_TIMEOUT=\${PUBLIC_TIMEOUT:-90}
+                PUBLIC_ATTEMPTS=\$(( (PUBLIC_TIMEOUT + 1) / 2 ))
+                if [ "\$PUBLIC_ATTEMPTS" -lt 1 ]; then PUBLIC_ATTEMPTS=1; fi
+
+                public_readiness_ok() {
+                  local check host path
+                  for check in \$PUBLIC_CHECKS; do
+                    host="\${check%%:*}"
+                    path="\${check#*:}"
+                    if [ -z "\$host" ] || [ -z "\$path" ] || [ "\$host" = "\$path" ]; then
+                      echo "Invalid public readiness check: \$check"
+                      return 1
+                    fi
+                    curl -fsS --connect-timeout 2 --max-time 8 \
+                      --resolve "\$host:443:127.0.0.1" \
+                      "https://\$host\$path" > /dev/null || return 1
+                  done
+                  return 0
+                }
+
+                echo "Public readiness via local nginx: \$PUBLIC_CHECKS"
+                for j in \$(seq 1 "\$PUBLIC_ATTEMPTS"); do
+                  if public_readiness_ok; then
+                    echo "OK $SERVICE public readiness on tag \$IMAGE_TAG"
+                    resume_worker_queue "deploy healthy: $TAG" true
+                    docker logout ghcr.io
+                    exit 0
+                  fi
+                  sleep 2
+                done
+
+                echo "FAIL: public readiness failed after \${PUBLIC_TIMEOUT}s"
+                break
               fi
               sleep 2
             done

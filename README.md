@@ -114,11 +114,24 @@ Deploya uma imagem GHCR no VPS via Docker Compose.
 - `worker-drain-enabled` (string, default `'true'`) - quando `true` e `workers` esta na lista efetiva, roda
   `npm run deploy:workers:drain` antes do restart.
 - `worker-drain-timeout-minutes` (string, default `'15'`) - timeout do drain.
+- `public-readiness-checks` (string, default `''`) - F1-175: lista separada por espaco de `host:/path`
+  validada no VPS via nginx local (`curl --resolve host:443:127.0.0.1`) depois do health local e antes de
+  declarar deploy saudavel. Vazio usa defaults por service: backend valida
+  `gamehunter.com.br:/api/health` e `gamehunter.com.br:/api/rpc/health`; frontend valida
+  `gamehunter.com.br:/`; admin valida `admin.gamehunter.com.br:/`. Use `none` apenas quando o service nao tem
+  rota publica por nginx.
+- `public-readiness-timeout-seconds` (string, default `'90'`) - tempo maximo do gate publico/nginx. Falha aciona
+  o rollback ja existente do reusable.
 
 O drain roda depois da migration do backend, usando a nova imagem ja pullada, e antes de `docker compose up` recriar
 `workers`. Em sucesso de health, o workflow chama `npm run deploy:workers:resume`; em rollback/falha, o trap tenta
 retomar a fila em best-effort. Exit codes do drain: `0` libera, `20` bloqueia por politica, `21` timeout, `22` estado
 inseguro e `1` erro tecnico.
+
+Depois do `docker compose up`, o reusable nao encerra mais apenas com o health local do container. O gate F1-175
+tambem prova que o nginx local consegue servir as rotas publicas configuradas sem `connect() failed`/upstream
+indisponivel. Isso evita declarar deploy verde enquanto Cloudflare ou o usuario ainda receberiam 502/504 por upstream
+recusado no edge/origem.
 
 Use override `deploy-workers=true` quando a release docs/API-only ainda precisa reiniciar workers por operacao manual.
 Use `deploy-workers=false` quando a mudanca de backend nao toca runtime dos workers e o diff automatico for
