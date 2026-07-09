@@ -385,6 +385,7 @@ jobs:
             HANDOFF_CANDIDATE_PORT=""
             HANDOFF_MARKER=""
             HANDOFF_NGINX_SITE="/etc/nginx/sites-enabled/gamehunter"
+            HANDOFF_NGINX_BACKUP_DIR="/tmp/gamehunter-deploy-nginx-backups"
 
             resume_worker_queue() {
               if [ -n "\$WORKER_DRAIN_ID" ]; then
@@ -411,12 +412,12 @@ jobs:
 
               local tmp backup
               tmp=\$(mktemp)
-              backup="\$HANDOFF_NGINX_SITE.f1-443.$DEPLOY_RUN_ID.remove.bak"
-              cp "\$HANDOFF_NGINX_SITE" "\$backup" || true
+              backup=\$(make_handoff_nginx_backup "remove")
               grep -v "\$HANDOFF_MARKER" "\$HANDOFF_NGINX_SITE" > "\$tmp"
               mv "\$tmp" "\$HANDOFF_NGINX_SITE"
               if nginx -t; then
                 nginx -s reload
+                rm -f "\$backup"
                 echo "Removed temporary nginx candidate upstream"
               else
                 echo "FAIL: nginx config invalid after candidate removal; restoring backup"
@@ -437,6 +438,14 @@ jobs:
             cleanup_handoff_candidate() {
               remove_handoff_candidate_upstream || true
               stop_handoff_candidate
+            }
+
+            make_handoff_nginx_backup() {
+              local suffix="$1"
+              mkdir -p "\$HANDOFF_NGINX_BACKUP_DIR"
+              local backup="\$HANDOFF_NGINX_BACKUP_DIR/gamehunter.f1-443.$DEPLOY_RUN_ID.\$suffix.bak"
+              cp "\$HANDOFF_NGINX_SITE" "\$backup"
+              echo "\$backup"
             }
 
             add_handoff_candidate_upstream() {
@@ -467,11 +476,11 @@ jobs:
                 END { if (inserted != 1) exit 42 }
               ' "\$HANDOFF_NGINX_SITE" > "\$tmp"
 
-              backup="\$HANDOFF_NGINX_SITE.f1-443.$DEPLOY_RUN_ID.bak"
-              cp "\$HANDOFF_NGINX_SITE" "\$backup"
+              backup=\$(make_handoff_nginx_backup "add")
               mv "\$tmp" "\$HANDOFF_NGINX_SITE"
               if nginx -t; then
                 nginx -s reload
+                rm -f "\$backup"
                 echo "Added temporary nginx candidate upstream 127.0.0.1:\$candidate_port to \$upstream_name"
               else
                 echo "FAIL: nginx config invalid with candidate upstream; restoring backup"
