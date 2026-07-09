@@ -94,6 +94,12 @@ function assertWorkflowKeepsGuardBeforeRecreate() {
   );
   assert.match(workflow, /gh-deploy-candidate:\$SERVICE:\$DEPLOY_RUN_ID/);
   assert.match(workflow, /remove_handoff_candidate_upstream/);
+  assert.match(workflow, /HANDOFF_NGINX_BACKUP_DIR="\/tmp\/gamehunter-deploy-nginx-backups"/);
+  assert.doesNotMatch(
+    workflow,
+    /backup="\\\$HANDOFF_NGINX_SITE\.f1-443/,
+    'nginx backups must not be written under sites-enabled because nginx includes backup files',
+  );
   assert.match(workflow, /rollback_service/);
 }
 
