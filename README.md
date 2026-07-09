@@ -128,10 +128,16 @@ O drain roda depois da migration do backend, usando a nova imagem ja pullada, e 
 retomar a fila em best-effort. Exit codes do drain: `0` libera, `20` bloqueia por politica, `21` timeout, `22` estado
 inseguro e `1` erro tecnico.
 
-Depois do `docker compose up`, o reusable nao encerra mais apenas com o health local do container. O gate F1-175
-tambem prova que o nginx local consegue servir as rotas publicas configuradas sem `connect() failed`/upstream
-indisponivel. Isso evita declarar deploy verde enquanto Cloudflare ou o usuario ainda receberiam 502/504 por upstream
-recusado no edge/origem.
+Para `backend` e `frontend`, o reusable agora protege o handoff de porta fixa antes de recriar o container canonico.
+Ele sobe um candidato temporario em porta local alternativa, valida health e checks publicos do proprio servico, adiciona
+essa porta ao upstream nginx como fallback, e so entao executa `docker compose up --force-recreate` na porta canonica.
+Depois que a porta canonica nova passa, o candidato e removido do upstream e parado. Em falha, o rollback recria a tag
+anterior enquanto o candidato continua protegendo o upstream publico. Readiness pos-restart sozinho nao e considerado
+traffic-safe para servicos atras de nginx em porta fixa.
+
+Depois do `docker compose up`, o reusable nao encerra apenas com o health local do container. O gate F1-175 tambem prova
+que o nginx local consegue servir as rotas publicas configuradas sem `connect() failed`/upstream indisponivel. Isso evita
+declarar deploy verde enquanto Cloudflare ou o usuario ainda receberiam 502/504 por upstream recusado no edge/origem.
 
 Use override `deploy-workers=true` quando a release docs/API-only ainda precisa reiniciar workers por operacao manual.
 Use `deploy-workers=false` quando a mudanca de backend nao toca runtime dos workers e o diff automatico for
