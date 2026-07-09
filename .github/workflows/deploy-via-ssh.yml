@@ -267,7 +267,125 @@ jobs:
               docker compose run -T --rm --no-deps "$SERVICE" $MIGRATION_CMD < /dev/null
             fi
 
+            PUBLIC_CHECKS="$PUBLIC_READINESS_CHECKS"
+            if [ -z "\$PUBLIC_CHECKS" ]; then
+              case "$SERVICE" in
+                backend)
+                  PUBLIC_CHECKS="gamehunter.com.br:/api/health gamehunter.com.br:/api/rpc/health"
+                  ;;
+                frontend)
+                  PUBLIC_CHECKS="gamehunter.com.br:/"
+                  ;;
+                admin)
+                  PUBLIC_CHECKS="admin.gamehunter.com.br:/"
+                  ;;
+                *)
+                  PUBLIC_CHECKS="none"
+                  ;;
+              esac
+            fi
+
+            PUBLIC_TIMEOUT="$PUBLIC_READINESS_TIMEOUT_SECONDS"
+            PUBLIC_TIMEOUT=\${PUBLIC_TIMEOUT:-90}
+            PUBLIC_ATTEMPTS=\$(( (PUBLIC_TIMEOUT + 1) / 2 ))
+            if [ "\$PUBLIC_ATTEMPTS" -lt 1 ]; then PUBLIC_ATTEMPTS=1; fi
+
+            public_readiness_ok() {
+              local check host path
+              for check in \$PUBLIC_CHECKS; do
+                host="\${check%%:*}"
+                path="\${check#*:}"
+                if [ -z "\$host" ] || [ -z "\$path" ] || [ "\$host" = "\$path" ]; then
+                  echo "Invalid public readiness check: \$check"
+                  return 1
+                fi
+                curl -fsS --connect-timeout 2 --max-time 8 \
+                  --resolve "\$host:443:127.0.0.1" \
+                  "https://\$host\$path" > /dev/null || return 1
+              done
+              return 0
+            }
+
+            wait_local_health() {
+              local port="\$1"
+              local label="\$2"
+              echo "Health check em localhost:\$port$HEALTH_PATH (\$label)"
+              for i in \$(seq 1 30); do
+                if curl -fsS "http://localhost:\$port$HEALTH_PATH" > /dev/null 2>&1; then
+                  echo "OK $SERVICE local health on \$label"
+                  return 0
+                fi
+                sleep 2
+              done
+              return 1
+            }
+
+            wait_public_readiness() {
+              local label="\$1"
+              if [ "\$PUBLIC_CHECKS" = "none" ]; then
+                echo "Public readiness skipped (\$label)"
+                return 0
+              fi
+              echo "Public readiness via local nginx (\$label): \$PUBLIC_CHECKS"
+              for j in \$(seq 1 "\$PUBLIC_ATTEMPTS"); do
+                if public_readiness_ok; then
+                  echo "OK $SERVICE public readiness on \$label"
+                  return 0
+                fi
+                sleep 2
+              done
+              echo "FAIL: public readiness failed after \${PUBLIC_TIMEOUT}s (\$label)"
+              return 1
+            }
+
+            candidate_direct_readiness_ok() {
+              local checked=0
+              local check host path
+              for check in \$PUBLIC_CHECKS; do
+                host="\${check%%:*}"
+                path="\${check#*:}"
+                if [ "$SERVICE" = "backend" ]; then
+                  case "\$path" in
+                    /api/*|/health) ;;
+                    *) continue ;;
+                  esac
+                fi
+                checked=1
+                curl -fsS --connect-timeout 2 --max-time 8 \
+                  -H "Host: \$host" \
+                  "http://127.0.0.1:\$HANDOFF_CANDIDATE_PORT\$path" > /dev/null || return 1
+              done
+              if [ "\$checked" -eq 0 ]; then
+                echo "Candidate direct readiness skipped: no $SERVICE-owned public paths"
+              fi
+              return 0
+            }
+
+            wait_candidate_direct_readiness() {
+              if [ "\$PUBLIC_CHECKS" = "none" ]; then
+                return 0
+              fi
+              if [ "$SERVICE" != "backend" ] && [ "$SERVICE" != "frontend" ]; then
+                return 0
+              fi
+              echo "Candidate direct readiness on localhost:\$HANDOFF_CANDIDATE_PORT"
+              for j in \$(seq 1 "\$PUBLIC_ATTEMPTS"); do
+                if candidate_direct_readiness_ok; then
+                  echo "OK $SERVICE candidate direct readiness"
+                  return 0
+                fi
+                sleep 2
+              done
+              echo "FAIL: candidate direct readiness failed after \${PUBLIC_TIMEOUT}s"
+              return 1
+            }
+
             WORKER_DRAIN_ID=""
+            HANDOFF_CANDIDATE_CONTAINER=""
+            HANDOFF_CANDIDATE_PORT=""
+            HANDOFF_MARKER=""
+            HANDOFF_NGINX_SITE="/etc/nginx/sites-enabled/gamehunter"
+
             resume_worker_queue() {
               if [ -n "\$WORKER_DRAIN_ID" ]; then
                 local reason="\${1:-deploy workflow finalizer}"
@@ -282,7 +400,157 @@ jobs:
                 fi
               fi
             }
-            trap 'status=\$?; if [ \$status -ne 0 ]; then resume_worker_queue "deploy workflow failed before completion"; fi; exit \$status' EXIT
+
+            remove_handoff_candidate_upstream() {
+              if [ -z "\$HANDOFF_MARKER" ] || [ ! -f "\$HANDOFF_NGINX_SITE" ]; then
+                return 0
+              fi
+              if ! grep -q "\$HANDOFF_MARKER" "\$HANDOFF_NGINX_SITE"; then
+                return 0
+              fi
+
+              local tmp backup
+              tmp=\$(mktemp)
+              backup="\$HANDOFF_NGINX_SITE.f1-443.$DEPLOY_RUN_ID.remove.bak"
+              cp "\$HANDOFF_NGINX_SITE" "\$backup" || true
+              grep -v "\$HANDOFF_MARKER" "\$HANDOFF_NGINX_SITE" > "\$tmp"
+              mv "\$tmp" "\$HANDOFF_NGINX_SITE"
+              if nginx -t; then
+                nginx -s reload
+                echo "Removed temporary nginx candidate upstream"
+              else
+                echo "FAIL: nginx config invalid after candidate removal; restoring backup"
+                mv "\$backup" "\$HANDOFF_NGINX_SITE"
+                nginx -t
+                nginx -s reload
+                return 1
+              fi
+            }
+
+            stop_handoff_candidate() {
+              if [ -n "\$HANDOFF_CANDIDATE_CONTAINER" ]; then
+                docker rm -f "\$HANDOFF_CANDIDATE_CONTAINER" >/dev/null 2>&1 || true
+                HANDOFF_CANDIDATE_CONTAINER=""
+              fi
+            }
+
+            cleanup_handoff_candidate() {
+              remove_handoff_candidate_upstream || true
+              stop_handoff_candidate
+            }
+
+            add_handoff_candidate_upstream() {
+              local upstream_name="\$1"
+              local canonical_port="\$2"
+              local candidate_port="\$3"
+              local tmp backup
+
+              HANDOFF_MARKER="gh-deploy-candidate:$SERVICE:$DEPLOY_RUN_ID"
+              if grep -q "\$HANDOFF_MARKER" "\$HANDOFF_NGINX_SITE"; then
+                return 0
+              fi
+
+              tmp=\$(mktemp)
+              awk -v upstream="upstream \$upstream_name" \
+                -v canonical_port="\$canonical_port" \
+                -v candidate_port="\$candidate_port" \
+                -v marker="\$HANDOFF_MARKER" '
+                \$0 ~ "^[[:space:]]*" upstream "[[:space:]]*\\\\{" { in_block=1 }
+                in_block && \$0 ~ "server 127\\\\.0\\\\.0\\\\.1:" canonical_port "[[:space:]]" && inserted == 0 {
+                  print
+                  print "    server 127.0.0.1:" candidate_port " max_fails=0; # " marker
+                  inserted=1
+                  next
+                }
+                in_block && \$0 ~ "^[[:space:]]*\\\\}" { in_block=0 }
+                { print }
+                END { if (inserted != 1) exit 42 }
+              ' "\$HANDOFF_NGINX_SITE" > "\$tmp"
+
+              backup="\$HANDOFF_NGINX_SITE.f1-443.$DEPLOY_RUN_ID.bak"
+              cp "\$HANDOFF_NGINX_SITE" "\$backup"
+              mv "\$tmp" "\$HANDOFF_NGINX_SITE"
+              if nginx -t; then
+                nginx -s reload
+                echo "Added temporary nginx candidate upstream 127.0.0.1:\$candidate_port to \$upstream_name"
+              else
+                echo "FAIL: nginx config invalid with candidate upstream; restoring backup"
+                mv "\$backup" "\$HANDOFF_NGINX_SITE"
+                nginx -t
+                nginx -s reload
+                return 1
+              fi
+            }
+
+            find_handoff_candidate_port() {
+              local base_port="\$1"
+              local port=\$(( base_port + 10000 ))
+              while ( : >/dev/tcp/127.0.0.1/\$port ) >/dev/null 2>&1; do
+                port=\$(( port + 1 ))
+              done
+              echo "\$port"
+            }
+
+            prepare_public_handoff() {
+              if [ "\$PUBLIC_CHECKS" = "none" ]; then
+                return 0
+              fi
+              if [ "$SERVICE" != "backend" ] && [ "$SERVICE" != "frontend" ]; then
+                return 0
+              fi
+              if [ ! -f "\$HANDOFF_NGINX_SITE" ]; then
+                echo "FAIL: nginx site config not found at \$HANDOFF_NGINX_SITE"
+                return 1
+              fi
+
+              local upstream_name candidate_port
+              upstream_name="gamehunter_$SERVICE"
+              candidate_port=\$(find_handoff_candidate_port "$DEFAULT_PORT")
+              HANDOFF_CANDIDATE_PORT="\$candidate_port"
+              HANDOFF_CANDIDATE_CONTAINER="gamehunter-$SERVICE-candidate-$DEPLOY_RUN_ID"
+
+              docker rm -f "\$HANDOFF_CANDIDATE_CONTAINER" >/dev/null 2>&1 || true
+              echo "Starting $SERVICE candidate on localhost:\$HANDOFF_CANDIDATE_PORT before canonical recreate"
+              docker compose run -d --name "\$HANDOFF_CANDIDATE_CONTAINER" --no-deps \
+                -e PORT="\$HANDOFF_CANDIDATE_PORT" \
+                "$SERVICE" >/dev/null
+
+              if ! wait_local_health "\$HANDOFF_CANDIDATE_PORT" "candidate $TAG"; then
+                echo "FAIL: candidate health failed before public handoff"
+                docker logs --tail=80 "\$HANDOFF_CANDIDATE_CONTAINER" 2>/dev/null || true
+                return 1
+              fi
+              if ! wait_candidate_direct_readiness; then
+                echo "FAIL: candidate direct readiness failed before public handoff"
+                docker logs --tail=80 "\$HANDOFF_CANDIDATE_CONTAINER" 2>/dev/null || true
+                return 1
+              fi
+
+              add_handoff_candidate_upstream "\$upstream_name" "$DEFAULT_PORT" "\$HANDOFF_CANDIDATE_PORT"
+              wait_public_readiness "candidate pool"
+            }
+
+            rollback_service() {
+              local reason="\$1"
+              echo "FAIL: \$reason -- auto-rolling back"
+              export IMAGE_TAG=rollback
+              grep -v "^IMAGE_TAG=" .env > .env.new || true
+              echo "IMAGE_TAG=\$IMAGE_TAG" >> .env.new
+              mv .env.new .env
+              docker compose up -d --no-build --force-recreate \$ALL_SERVICES
+
+              PORT=\$(grep "^PORT=" .env | cut -d= -f2 | head -1)
+              PORT=\${PORT:-$DEFAULT_PORT}
+              wait_local_health "\$PORT" "rollback" || true
+              remove_handoff_candidate_upstream || true
+              wait_public_readiness "rollback" || true
+              stop_handoff_candidate
+              resume_worker_queue "deploy failed after rollback"
+              docker logout ghcr.io
+              exit 1
+            }
+
+            trap 'status=\$?; if [ \$status -ne 0 ]; then resume_worker_queue "deploy workflow failed before completion"; cleanup_handoff_candidate; fi; exit \$status' EXIT
 
             SHOULD_DRAIN_WORKERS=false
             if [ "$WORKER_DRAIN_ENABLED" = "true" ] && printf ' %s ' "\$ALL_SERVICES" | grep -q ' workers '; then
@@ -305,87 +573,32 @@ jobs:
               fi
             fi
 
+            prepare_public_handoff
             docker compose up -d --no-build --force-recreate \$ALL_SERVICES
 
             PORT=\$(grep "^PORT=" .env | cut -d= -f2 | head -1)
             PORT=\${PORT:-$DEFAULT_PORT}
-            echo "Health check em localhost:\$PORT$HEALTH_PATH"
-            for i in \$(seq 1 30); do
-              if curl -fsS "http://localhost:\$PORT$HEALTH_PATH" > /dev/null 2>&1; then
-                echo "OK $SERVICE local health on tag \$IMAGE_TAG"
+            if ! wait_local_health "\$PORT" "canonical $TAG"; then
+              rollback_service "canonical health failed after 60s"
+            fi
 
-                PUBLIC_CHECKS="$PUBLIC_READINESS_CHECKS"
-                if [ -z "\$PUBLIC_CHECKS" ]; then
-                  case "$SERVICE" in
-                    backend)
-                      PUBLIC_CHECKS="gamehunter.com.br:/api/health gamehunter.com.br:/api/rpc/health"
-                      ;;
-                    frontend)
-                      PUBLIC_CHECKS="gamehunter.com.br:/"
-                      ;;
-                    admin)
-                      PUBLIC_CHECKS="admin.gamehunter.com.br:/"
-                      ;;
-                    *)
-                      PUBLIC_CHECKS="none"
-                      ;;
-                  esac
-                fi
+            if ! wait_public_readiness "candidate pool"; then
+              rollback_service "public readiness failed while candidate protected the upstream"
+            fi
 
-                if [ "\$PUBLIC_CHECKS" = "none" ]; then
-                  echo "Public readiness skipped"
-                  resume_worker_queue "deploy healthy: $TAG" true
-                  docker logout ghcr.io
-                  exit 0
-                fi
-
-                PUBLIC_TIMEOUT="$PUBLIC_READINESS_TIMEOUT_SECONDS"
-                PUBLIC_TIMEOUT=\${PUBLIC_TIMEOUT:-90}
-                PUBLIC_ATTEMPTS=\$(( (PUBLIC_TIMEOUT + 1) / 2 ))
-                if [ "\$PUBLIC_ATTEMPTS" -lt 1 ]; then PUBLIC_ATTEMPTS=1; fi
-
-                public_readiness_ok() {
-                  local check host path
-                  for check in \$PUBLIC_CHECKS; do
-                    host="\${check%%:*}"
-                    path="\${check#*:}"
-                    if [ -z "\$host" ] || [ -z "\$path" ] || [ "\$host" = "\$path" ]; then
-                      echo "Invalid public readiness check: \$check"
-                      return 1
-                    fi
-                    curl -fsS --connect-timeout 2 --max-time 8 \
-                      --resolve "\$host:443:127.0.0.1" \
-                      "https://\$host\$path" > /dev/null || return 1
-                  done
-                  return 0
-                }
-
-                echo "Public readiness via local nginx: \$PUBLIC_CHECKS"
-                for j in \$(seq 1 "\$PUBLIC_ATTEMPTS"); do
-                  if public_readiness_ok; then
-                    echo "OK $SERVICE public readiness on tag \$IMAGE_TAG"
-                    resume_worker_queue "deploy healthy: $TAG" true
-                    docker logout ghcr.io
-                    exit 0
-                  fi
-                  sleep 2
-                done
-
-                echo "FAIL: public readiness failed after \${PUBLIC_TIMEOUT}s"
-                break
+            remove_handoff_candidate_upstream
+            if ! wait_public_readiness "canonical upstream"; then
+              if [ -n "\$HANDOFF_CANDIDATE_PORT" ]; then
+                add_handoff_candidate_upstream "gamehunter_$SERVICE" "$DEFAULT_PORT" "\$HANDOFF_CANDIDATE_PORT" || true
               fi
-              sleep 2
-            done
+              rollback_service "canonical public readiness failed after candidate removal"
+            fi
 
-            echo "FAIL: Health check failed after 60s — auto-rolling back"
-            export IMAGE_TAG=rollback
-            grep -v "^IMAGE_TAG=" .env > .env.new || true
-            echo "IMAGE_TAG=\$IMAGE_TAG" >> .env.new
-            mv .env.new .env
-            docker compose up -d --no-build --force-recreate \$ALL_SERVICES
-            resume_worker_queue "deploy health failed after rollback"
+            stop_handoff_candidate
+            resume_worker_queue "deploy healthy: $TAG" true
             docker logout ghcr.io
-            exit 1
+            exit 0
+
           EOF
 
       - name: Purge Cloudflare cache (full)
