@@ -32,13 +32,13 @@ on:
         default: 'npm publish'
         type: string
       needs-cross-repo-deps:
-        description: 'Set true if package depends on other @gamehunter-com-br/* packages (uses NPM_PACKAGES_READ_TOKEN for npm ci)'
+        description: 'Set true if package depends on other @gamehunter-com-br/* packages (uses optional NPM_PACKAGES_READ_TOKEN, then GITHUB_TOKEN)'
         required: false
         default: false
         type: boolean
     secrets:
       NPM_PACKAGES_READ_TOKEN:
-        description: 'PAT com read:packages — required quando needs-cross-repo-deps=true'
+        description: 'PAT opcional com read:packages; fallback para GITHUB_TOKEN do caller'
         required: false
 
 permissions:
@@ -100,7 +100,7 @@ jobs:
         if: ${{ inputs.needs-cross-repo-deps && steps.publish-check.outputs.already_published != 'true' }}
         run: npm ci
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_PACKAGES_READ_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_PACKAGES_READ_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Install deps (no cross-repo)
         if: ${{ !inputs.needs-cross-repo-deps && steps.publish-check.outputs.already_published != 'true' }}
