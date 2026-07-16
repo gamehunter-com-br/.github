@@ -62,10 +62,14 @@ Publica package npm no GitHub Packages quando tag `vX.Y.Z` é pushada.
 - `runner` (string, default `blacksmith-4vcpu-ubuntu-2404`)
 - `build-command` (string, default `npm run build`)
 - `publish-command` (string, default `npm publish`)
-- `needs-cross-repo-deps` (boolean, default `false`) — set `true` se package depende de outros `@gamehunter-com-br/*` (usa `NPM_PACKAGES_READ_TOKEN` em `npm ci`).
+- `needs-cross-repo-deps` (boolean, default `false`) — set `true` se o package
+  depende de outros `@gamehunter-com-br/*`; o `npm ci` usa o secret opcional e
+  faz fallback para o `GITHUB_TOKEN` do caller.
 
 **Secrets:**
-- `NPM_PACKAGES_READ_TOKEN` (opcional) — required quando `needs-cross-repo-deps=true`.
+- `NPM_PACKAGES_READ_TOKEN` (opcional) — usado quando presente; caso contrário,
+  o install usa o `GITHUB_TOKEN` do caller. O repositório consumidor precisa de
+  acesso de leitura ao package em **Manage Actions access** para esse fallback.
 
 **Stub no consumer (~17 LoC):**
 
