@@ -1,0 +1,45 @@
+name: Validate reusable workflows
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - 'scripts/test-deploy-handoff-readiness.mjs'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/**'
+      - 'scripts/test-deploy-handoff-readiness.mjs'
+
+permissions:
+  contents: read
+
+jobs:
+  structural-fixtures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned actionlint
+        env:
+          ACTIONLINT_VERSION: '1.7.12'
+          ACTIONLINT_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl -fsSLo "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          chmod 0755 "$RUNNER_TEMP/actionlint"
+      - name: Lint reusable workflows
+        run: |
+          # Shell semantics are covered by the dedicated fixture below. Keep this
+          # gate deterministic across runner images by disabling optional tools.
+          "$RUNNER_TEMP/actionlint" -no-color -shellcheck="" -pyflakes="" \
+            .github/workflows/deploy-via-ssh.yml \
+            .github/workflows/rollback-via-ssh.yml \
+            .github/workflows/validate-reusable-workflows.yml
+      - name: Validate deploy and rollback invariants
+        run: node scripts/test-deploy-handoff-readiness.mjs
