@@ -110,16 +110,18 @@ jobs:
         id: tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
-          if [ -n "${{ inputs.tag }}" ]; then
-            TAG="${{ inputs.tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
           else
-            TAG="${{ github.event.workflow_run.head_branch }}"
+            TAG="$WORKFLOW_RUN_HEAD_BRANCH"
           fi
           if [[ ! "$TAG" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|sha-[0-9a-f]{7})$ ]]; then
-            echo "::error::Tag '$TAG' nao e semver (vX.Y.Z) nem sha-XXXXXXX"
+            echo "::error::Tag deve ser semver (vX.Y.Z) ou sha-XXXXXXX"
             exit 1
           fi
           if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -225,6 +227,99 @@ jobs:
           ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" 'bash -euo pipefail -s' << EOF
             cd "$VPS_PATH"
 
+            # ENV_FILE_HARDENING_START
+            # .env contem segredos de runtime. O workflow troca apenas IMAGE_TAG,
+            # sempre via arquivo temporario no mesmo diretorio e modo 0600.
+            ENV_TMP=""
+
+            cleanup_env_tmp() {
+              if [ -n "\$ENV_TMP" ]; then
+                rm -f -- "\$ENV_TMP"
+                ENV_TMP=""
+              fi
+            }
+
+            cleanup_legacy_env_new() {
+              local app_dir
+              local legacy_path
+              local legacy_resolved
+
+              app_dir=\$(pwd -P)
+              legacy_path="\$app_dir/.env.new"
+              if [ ! -e "\$legacy_path" ] && [ ! -L "\$legacy_path" ]; then
+                return 0
+              fi
+
+              if [ -L "\$legacy_path" ] || [ ! -f "\$legacy_path" ]; then
+                echo "FAIL: legacy .env.new must be a regular non-symlink file"
+                return 1
+              fi
+
+              legacy_resolved=\$(readlink -f -- "\$legacy_path") || {
+                echo "FAIL: could not resolve legacy .env.new"
+                return 1
+              }
+              if [ "\$legacy_resolved" != "\$app_dir/.env.new" ]; then
+                echo "FAIL: legacy .env.new resolves outside the application directory"
+                return 1
+              fi
+
+              rm -f -- "\$legacy_path"
+              if [ -e "\$legacy_path" ] || [ -L "\$legacy_path" ]; then
+                echo "FAIL: legacy .env.new could not be removed safely"
+                return 1
+              fi
+            }
+
+            update_image_tag_env() {
+              local image_tag="\$1"
+              local grep_status=0
+              local mode
+
+              cleanup_env_tmp
+              if ! cleanup_legacy_env_new; then
+                return 1
+              fi
+              if [ ! -f .env ] || [ -L .env ]; then
+                echo "FAIL: .env must be a regular non-symlink file"
+                return 1
+              fi
+              # Escopa o umask ao temporario para nao alterar outros artefatos do deploy.
+              if ! ENV_TMP=\$(umask 077; mktemp ".env.tmp.XXXXXX"); then
+                ENV_TMP=""
+                return 1
+              fi
+              grep -v '^IMAGE_TAG=' .env > "\$ENV_TMP" || grep_status=\$?
+              if [ "\$grep_status" -gt 1 ]; then
+                cleanup_env_tmp
+                return "\$grep_status"
+              fi
+
+              if ! printf 'IMAGE_TAG=%s\n' "\$image_tag" >> "\$ENV_TMP"; then
+                return 1
+              fi
+              if ! chmod 600 "\$ENV_TMP"; then
+                return 1
+              fi
+              if ! mv -fT -- "\$ENV_TMP" .env; then
+                return 1
+              fi
+              ENV_TMP=""
+              if [ ! -f .env ] || [ -L .env ]; then
+                echo "FAIL: .env handoff did not produce a regular non-symlink file"
+                return 1
+              fi
+
+              mode=\$(stat -c '%a' .env)
+              if [ "\$mode" != "600" ]; then
+                echo "FAIL: .env permissions are \$mode; expected 600"
+                return 1
+              fi
+            }
+            # ENV_FILE_HARDENING_END
+
+            trap 'status=\$?; cleanup_env_tmp; exit \$status' EXIT
+
             git fetch origin main
             git reset --hard origin/main
 
@@ -236,9 +331,7 @@ jobs:
             fi
 
             export IMAGE_TAG="$TAG"
-            grep -v "^IMAGE_TAG=" .env > .env.new || true
-            echo "IMAGE_TAG=\$IMAGE_TAG" >> .env.new
-            mv .env.new .env
+            update_image_tag_env "\$IMAGE_TAG"
 
             EXTRA_SERVICES_EFFECTIVE="$EXTRA_SERVICES"
             if [ "$SERVICE" = "backend" ]; then
@@ -543,9 +636,7 @@ jobs:
               local reason="\$1"
               echo "FAIL: \$reason -- auto-rolling back"
               export IMAGE_TAG=rollback
-              grep -v "^IMAGE_TAG=" .env > .env.new || true
-              echo "IMAGE_TAG=\$IMAGE_TAG" >> .env.new
-              mv .env.new .env
+              update_image_tag_env "\$IMAGE_TAG"
               docker compose up -d --no-build --force-recreate \$ALL_SERVICES
 
               PORT=\$(grep "^PORT=" .env | cut -d= -f2 | head -1)
@@ -559,7 +650,7 @@ jobs:
               exit 1
             }
 
-            trap 'status=\$?; if [ \$status -ne 0 ]; then resume_worker_queue "deploy workflow failed before completion"; cleanup_handoff_candidate; fi; exit \$status' EXIT
+            trap 'status=\$?; cleanup_env_tmp; if [ \$status -ne 0 ]; then resume_worker_queue "deploy workflow failed before completion"; cleanup_handoff_candidate; fi; exit \$status' EXIT
 
             SHOULD_DRAIN_WORKERS=false
             if [ "$WORKER_DRAIN_ENABLED" = "true" ] && printf ' %s ' "\$ALL_SERVICES" | grep -q ' workers '; then

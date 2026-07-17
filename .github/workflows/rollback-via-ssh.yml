@@ -68,6 +68,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Validate rollback image tag
+        id: rollback-tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|sha-[0-9a-f]{7})$ ]]; then
+            echo "::error::Rollback tag must match vX.Y.Z or sha-XXXXXXX"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - name: Set up SSH
         run: |
           mkdir -p ~/.ssh
@@ -78,7 +90,7 @@ jobs:
       - name: Restore image tag on VPS
         env:
           IMAGE_BASE: ghcr.io/${{ github.repository }}
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ steps.rollback-tag.outputs.tag }}
           SERVICE: ${{ inputs.service-name }}
           VPS_PATH: ${{ inputs.vps-path }}
           VPS_HOST: ${{ inputs.vps-host }}
@@ -95,12 +107,103 @@ jobs:
           ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" 'bash -euo pipefail -s' << EOF
             cd "$VPS_PATH"
 
+            # ENV_FILE_HARDENING_START
+            # .env contem segredos de runtime. O workflow troca apenas IMAGE_TAG,
+            # sempre via arquivo temporario no mesmo diretorio e modo 0600.
+            ENV_TMP=""
+
+            cleanup_env_tmp() {
+              if [ -n "\$ENV_TMP" ]; then
+                rm -f -- "\$ENV_TMP"
+                ENV_TMP=""
+              fi
+            }
+
+            cleanup_legacy_env_new() {
+              local app_dir
+              local legacy_path
+              local legacy_resolved
+
+              app_dir=\$(pwd -P)
+              legacy_path="\$app_dir/.env.new"
+              if [ ! -e "\$legacy_path" ] && [ ! -L "\$legacy_path" ]; then
+                return 0
+              fi
+
+              if [ -L "\$legacy_path" ] || [ ! -f "\$legacy_path" ]; then
+                echo "FAIL: legacy .env.new must be a regular non-symlink file"
+                return 1
+              fi
+
+              legacy_resolved=\$(readlink -f -- "\$legacy_path") || {
+                echo "FAIL: could not resolve legacy .env.new"
+                return 1
+              }
+              if [ "\$legacy_resolved" != "\$app_dir/.env.new" ]; then
+                echo "FAIL: legacy .env.new resolves outside the application directory"
+                return 1
+              fi
+
+              rm -f -- "\$legacy_path"
+              if [ -e "\$legacy_path" ] || [ -L "\$legacy_path" ]; then
+                echo "FAIL: legacy .env.new could not be removed safely"
+                return 1
+              fi
+            }
+
+            update_image_tag_env() {
+              local image_tag="\$1"
+              local grep_status=0
+              local mode
+
+              cleanup_env_tmp
+              if ! cleanup_legacy_env_new; then
+                return 1
+              fi
+              if [ ! -f .env ] || [ -L .env ]; then
+                echo "FAIL: .env must be a regular non-symlink file"
+                return 1
+              fi
+              # Escopa o umask ao temporario para nao alterar outros artefatos do deploy.
+              if ! ENV_TMP=\$(umask 077; mktemp ".env.tmp.XXXXXX"); then
+                ENV_TMP=""
+                return 1
+              fi
+              grep -v '^IMAGE_TAG=' .env > "\$ENV_TMP" || grep_status=\$?
+              if [ "\$grep_status" -gt 1 ]; then
+                cleanup_env_tmp
+                return "\$grep_status"
+              fi
+
+              if ! printf 'IMAGE_TAG=%s\n' "\$image_tag" >> "\$ENV_TMP"; then
+                return 1
+              fi
+              if ! chmod 600 "\$ENV_TMP"; then
+                return 1
+              fi
+              if ! mv -fT -- "\$ENV_TMP" .env; then
+                return 1
+              fi
+              ENV_TMP=""
+              if [ ! -f .env ] || [ -L .env ]; then
+                echo "FAIL: .env handoff did not produce a regular non-symlink file"
+                return 1
+              fi
+
+              mode=\$(stat -c '%a' .env)
+              if [ "\$mode" != "600" ]; then
+                echo "FAIL: .env permissions are \$mode; expected 600"
+                return 1
+              fi
+            }
+            # ENV_FILE_HARDENING_END
+
+            trap 'status=\$?; cleanup_env_tmp; exit \$status' EXIT
+
             echo "$GHCR_PULL_TOKEN" | docker login ghcr.io -u "$GH_OWNER" --password-stdin
 
             export IMAGE_TAG="$TAG"
-            grep -v "^IMAGE_TAG=" .env > .env.new || true
-            echo "IMAGE_TAG=\$IMAGE_TAG" >> .env.new
-            mv .env.new .env
+            update_image_tag_env "\$IMAGE_TAG"
 
             ALL_SERVICES="$SERVICE $EXTRA_SERVICES"
             docker compose pull \$ALL_SERVICES
@@ -123,6 +226,12 @@ jobs:
 
       - name: Summary
         if: always()
+        env:
+          TAG: ${{ steps.rollback-tag.outputs.tag }}
         run: |
           echo "## Rollback ${{ job.status }} (${{ inputs.service-name }})" >> $GITHUB_STEP_SUMMARY
-          echo "Tag restaurado: \`${{ inputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$TAG" ]; then
+            printf 'Tag restaurado: `%s`\n' "$TAG" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Tag rejeitada antes da conexao SSH." >> "$GITHUB_STEP_SUMMARY"
+          fi
