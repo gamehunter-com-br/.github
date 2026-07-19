@@ -128,6 +128,7 @@ function extractEnvHardeningBlock(workflow, label) {
 
   return workflow
     .slice(start, end + envHardeningEnd.length)
+    .replace(/\r\n/g, '\n')
     .replace(/\\\$/g, () => '$');
 }
 
@@ -229,6 +230,47 @@ function assertDeployTagInputIsNotInterpolatedIntoShellSource() {
   assert.ok(workflow.includes('TAG="$INPUT_TAG"'));
 }
 
+function assertReleaseIdentityContract() {
+  const deploy = readFileSync(deployWorkflowPath, 'utf8');
+  const rollback = readFileSync(rollbackWorkflowPath, 'utf8');
+
+  for (const [label, workflow] of [
+    ['deploy', deploy],
+    ['rollback', rollback],
+  ]) {
+    assert.match(
+      workflow,
+      /release-identity-enabled:\s+[\s\S]*?default: false\s+[\s\S]*?type: boolean/,
+      `${label} workflow must expose an opt-in release identity contract`,
+    );
+    assert.ok(
+      workflow.includes('RELEASE_IDENTITY_ENABLED: ${{ inputs.release-identity-enabled }}'),
+      `${label} workflow must pass the opt-in through an environment value`,
+    );
+    assert.ok(workflow.includes('resolve_release_identity()'));
+    assert.ok(workflow.includes('org.opencontainers.image.revision'));
+    assert.ok(workflow.includes('.RepoDigests'));
+    assert.ok(workflow.includes("^sha256:[0-9a-f]{64}$"));
+    assert.ok(workflow.includes("^[0-9a-f]{7,64}$"));
+    assert.ok(workflow.includes('GH_RELEASE_TAG="\\$release_tag"'));
+    assert.ok(workflow.includes('GH_GIT_SHA="\\$git_sha"'));
+    assert.ok(workflow.includes('GH_IMAGE_DIGEST="\\$image_digest"'));
+    assert.ok(
+      workflow.includes(
+        'update_image_tag_env "\\$IMAGE_TAG" "\\$GH_RELEASE_TAG" "\\$GH_GIT_SHA" "\\$GH_IMAGE_DIGEST"',
+      ),
+      `${label} workflow must persist the verified tuple atomically`,
+    );
+
+    const pullIndex = workflow.lastIndexOf('docker compose pull');
+    const resolveIndex = workflow.lastIndexOf('resolve_release_identity ');
+    const persistIndex = workflow.lastIndexOf(
+      'update_image_tag_env "\\$IMAGE_TAG" "\\$GH_RELEASE_TAG" "\\$GH_GIT_SHA" "\\$GH_IMAGE_DIGEST"',
+    );
+    assert.ok(pullIndex > -1 && resolveIndex > pullIndex && persistIndex > resolveIndex);
+  }
+}
+
 function runEnvHardeningFixture(label, hardeningBlock) {
   if (process.platform === 'win32') {
     return false;
@@ -291,6 +333,39 @@ fi
 unset -f grep
 test -z "$(find . -maxdepth 1 -name '.env.tmp.*' -print -quit)"
 grep -qx 'IMAGE_TAG=release-fixture' .env
+
+update_image_tag_env \
+  'v9.9.9' \
+  'v9.9.9' \
+  'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+test "$(grep -c '^IMAGE_TAG=' .env)" = '1'
+test "$(grep -c '^GH_RELEASE_TAG=' .env)" = '1'
+test "$(grep -c '^GH_GIT_SHA=' .env)" = '1'
+test "$(grep -c '^GH_IMAGE_DIGEST=' .env)" = '1'
+grep -qx 'IMAGE_TAG=v9.9.9' .env
+grep -qx 'GH_RELEASE_TAG=v9.9.9' .env
+grep -qx 'GH_GIT_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' .env
+grep -qx 'GH_IMAGE_DIGEST=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' .env
+
+docker() {
+  case "$*" in
+    *org.opencontainers.image.revision*)
+      printf '%s\n' 'cccccccccccccccccccccccccccccccccccccccc'
+      ;;
+    *.RepoDigests*)
+      printf '%s\n' 'ghcr.io/gamehunter-com-br/backend@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+resolve_release_identity 'ghcr.io/gamehunter-com-br/backend:v9.9.9' 'v9.9.9'
+test "$GH_RELEASE_TAG" = 'v9.9.9'
+test "$GH_GIT_SHA" = 'cccccccccccccccccccccccccccccccccccccccc'
+test "$GH_IMAGE_DIGEST" = 'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
+unset -f docker
 `;
   const exitTrapScript = `#!/usr/bin/env bash
 set -euo pipefail
@@ -425,9 +500,10 @@ assert.equal(rollback.afterRollback.servedBy, 'canonical-rollback');
 assertWorkflowKeepsGuardBeforeRecreate();
 assertRollbackTagIsValidatedBeforeSsh();
 assertDeployTagInputIsNotInterpolatedIntoShellSource();
+assertReleaseIdentityContract();
 
-const deployEnv = assertWorkflowHardensEnvFile(deployWorkflowPath, 'deploy workflow', 2);
-const rollbackEnv = assertWorkflowHardensEnvFile(rollbackWorkflowPath, 'rollback workflow', 1);
+const deployEnv = assertWorkflowHardensEnvFile(deployWorkflowPath, 'deploy workflow', 4);
+const rollbackEnv = assertWorkflowHardensEnvFile(rollbackWorkflowPath, 'rollback workflow', 2);
 const functionalFixtureRan = [
   runEnvHardeningFixture('deploy workflow', deployEnv.hardeningBlock),
   runEnvHardeningFixture('rollback workflow', rollbackEnv.hardeningBlock),

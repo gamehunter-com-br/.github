@@ -42,6 +42,11 @@ on:
         required: false
         default: ''
         type: string
+      release-identity-enabled:
+        description: 'Persiste tag, git SHA e digest verificados no .env do runtime'
+        required: false
+        default: false
+        type: boolean
       runner:
         description: 'GitHub Actions runner'
         required: false
@@ -98,6 +103,7 @@ jobs:
           HEALTH_PATH: ${{ inputs.health-path }}
           DEFAULT_PORT: ${{ inputs.default-port }}
           EXTRA_SERVICES: ${{ inputs.extra-services }}
+          RELEASE_IDENTITY_ENABLED: ${{ inputs.release-identity-enabled }}
           GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
           GH_OWNER: ${{ github.repository_owner }}
         run: |
@@ -153,8 +159,31 @@ jobs:
 
             update_image_tag_env() {
               local image_tag="\$1"
+              local release_tag="\${2:-}"
+              local git_sha="\${3:-}"
+              local image_digest="\${4:-}"
+              local identity_enabled=false
               local grep_status=0
               local mode
+
+              if [ "\$#" -eq 4 ]; then
+                identity_enabled=true
+                if [[ ! "\$release_tag" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|sha-[0-9a-f]{7})$ ]]; then
+                  echo "FAIL: invalid release identity tag"
+                  return 1
+                fi
+                if [[ ! "\$git_sha" =~ ^[0-9a-f]{7,64}$ ]]; then
+                  echo "FAIL: invalid release identity git SHA"
+                  return 1
+                fi
+                if [[ ! "\$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                  echo "FAIL: invalid release identity image digest"
+                  return 1
+                fi
+              elif [ "\$#" -ne 1 ]; then
+                echo "FAIL: release identity must be complete or omitted"
+                return 1
+              fi
 
               cleanup_env_tmp
               if ! cleanup_legacy_env_new; then
@@ -169,7 +198,11 @@ jobs:
                 ENV_TMP=""
                 return 1
               fi
-              grep -v '^IMAGE_TAG=' .env > "\$ENV_TMP" || grep_status=\$?
+              if [ "\$identity_enabled" = "true" ]; then
+                grep -Ev '^(IMAGE_TAG|GH_RELEASE_TAG|GH_GIT_SHA|GH_IMAGE_DIGEST)=' .env > "\$ENV_TMP" || grep_status=\$?
+              else
+                grep -v '^IMAGE_TAG=' .env > "\$ENV_TMP" || grep_status=\$?
+              fi
               if [ "\$grep_status" -gt 1 ]; then
                 cleanup_env_tmp
                 return "\$grep_status"
@@ -177,6 +210,12 @@ jobs:
 
               if ! printf 'IMAGE_TAG=%s\n' "\$image_tag" >> "\$ENV_TMP"; then
                 return 1
+              fi
+              if [ "\$identity_enabled" = "true" ]; then
+                if ! printf 'GH_RELEASE_TAG=%s\nGH_GIT_SHA=%s\nGH_IMAGE_DIGEST=%s\n' \
+                  "\$release_tag" "\$git_sha" "\$image_digest" >> "\$ENV_TMP"; then
+                  return 1
+                fi
               fi
               if ! chmod 600 "\$ENV_TMP"; then
                 return 1
@@ -196,6 +235,40 @@ jobs:
                 return 1
               fi
             }
+
+            resolve_release_identity() {
+              local image_ref="\$1"
+              local release_tag="\$2"
+              local git_sha
+              local repo_digest
+              local image_digest
+
+              git_sha=\$(docker image inspect \
+                --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+                "\$image_ref")
+              repo_digest=\$(docker image inspect \
+                --format '{{ index .RepoDigests 0 }}' \
+                "\$image_ref")
+              image_digest="\${repo_digest##*@}"
+
+              if [[ ! "\$release_tag" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|sha-[0-9a-f]{7})$ ]]; then
+                echo "FAIL: invalid release identity tag"
+                return 1
+              fi
+              if [[ ! "\$git_sha" =~ ^[0-9a-f]{7,64}$ ]]; then
+                echo "FAIL: image is missing a valid OCI revision label"
+                return 1
+              fi
+              if [[ ! "\$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "FAIL: pulled image is missing a valid repository digest"
+                return 1
+              fi
+
+              GH_RELEASE_TAG="\$release_tag"
+              GH_GIT_SHA="\$git_sha"
+              GH_IMAGE_DIGEST="\$image_digest"
+              export GH_RELEASE_TAG GH_GIT_SHA GH_IMAGE_DIGEST
+            }
             # ENV_FILE_HARDENING_END
 
             trap 'status=\$?; cleanup_env_tmp; exit \$status' EXIT
@@ -203,10 +276,14 @@ jobs:
             echo "$GHCR_PULL_TOKEN" | docker login ghcr.io -u "$GH_OWNER" --password-stdin
 
             export IMAGE_TAG="$TAG"
-            update_image_tag_env "\$IMAGE_TAG"
-
             ALL_SERVICES="$SERVICE $EXTRA_SERVICES"
             docker compose pull \$ALL_SERVICES
+            if [ "$RELEASE_IDENTITY_ENABLED" = "true" ]; then
+              resolve_release_identity "${IMAGE}:$TAG" "$TAG"
+              update_image_tag_env "\$IMAGE_TAG" "\$GH_RELEASE_TAG" "\$GH_GIT_SHA" "\$GH_IMAGE_DIGEST"
+            else
+              update_image_tag_env "\$IMAGE_TAG"
+            fi
             docker compose up -d --no-build \$ALL_SERVICES
 
             PORT=\$(grep "^PORT=" .env | cut -d= -f2 | head -1)

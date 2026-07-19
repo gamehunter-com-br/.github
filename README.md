@@ -118,6 +118,10 @@ Deploya uma imagem GHCR no VPS via Docker Compose.
 - `worker-drain-enabled` (string, default `'true'`) - quando `true` e `workers` esta na lista efetiva, roda
   `npm run deploy:workers:drain` antes do restart.
 - `worker-drain-timeout-minutes` (string, default `'15'`) - timeout do drain.
+- `release-identity-enabled` (boolean, default `false`) - depois do pull, valida os labels OCI e o repo digest
+  da imagem e persiste atomicamente `GH_RELEASE_TAG`, `GH_GIT_SHA` e `GH_IMAGE_DIGEST` no `.env`, junto de
+  `IMAGE_TAG`. O deploy falha fechado se qualquer parte da tupla estiver ausente ou malformada. Use somente em
+  runtimes que consomem a identidade da release; o rollback reutiliza a mesma validação.
 - `public-readiness-checks` (string, default `''`) - F1-175: lista separada por espaco de `host:/path`
   validada no VPS via nginx local (`curl --resolve host:443:127.0.0.1`) depois do health local e antes de
   declarar deploy saudavel. Vazio usa defaults por service: backend valida

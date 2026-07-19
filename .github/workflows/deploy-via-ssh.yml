@@ -63,6 +63,11 @@ on:
         required: false
         default: '15'
         type: string
+      release-identity-enabled:
+        description: 'Persiste tag, git SHA e digest verificados no .env do runtime'
+        required: false
+        default: false
+        type: boolean
       migration-cmd:
         description: 'Comando de migration (ex: npm run migrate). Vazio pula.'
         required: false
@@ -218,6 +223,7 @@ jobs:
           DEPLOY_WORKERS: ${{ steps.worker-mode.outputs.mode }}
           WORKER_DRAIN_ENABLED: ${{ inputs.worker-drain-enabled }}
           WORKER_DRAIN_TIMEOUT_MINUTES: ${{ inputs.worker-drain-timeout-minutes }}
+          RELEASE_IDENTITY_ENABLED: ${{ inputs.release-identity-enabled }}
           DEPLOY_RUN_ID: ${{ github.run_id }}
           MIGRATION_CMD: ${{ inputs.migration-cmd }}
           GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
@@ -273,8 +279,31 @@ jobs:
 
             update_image_tag_env() {
               local image_tag="\$1"
+              local release_tag="\${2:-}"
+              local git_sha="\${3:-}"
+              local image_digest="\${4:-}"
+              local identity_enabled=false
               local grep_status=0
               local mode
+
+              if [ "\$#" -eq 4 ]; then
+                identity_enabled=true
+                if [[ ! "\$release_tag" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|sha-[0-9a-f]{7})$ ]]; then
+                  echo "FAIL: invalid release identity tag"
+                  return 1
+                fi
+                if [[ ! "\$git_sha" =~ ^[0-9a-f]{7,64}$ ]]; then
+                  echo "FAIL: invalid release identity git SHA"
+                  return 1
+                fi
+                if [[ ! "\$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                  echo "FAIL: invalid release identity image digest"
+                  return 1
+                fi
+              elif [ "\$#" -ne 1 ]; then
+                echo "FAIL: release identity must be complete or omitted"
+                return 1
+              fi
 
               cleanup_env_tmp
               if ! cleanup_legacy_env_new; then
@@ -289,7 +318,11 @@ jobs:
                 ENV_TMP=""
                 return 1
               fi
-              grep -v '^IMAGE_TAG=' .env > "\$ENV_TMP" || grep_status=\$?
+              if [ "\$identity_enabled" = "true" ]; then
+                grep -Ev '^(IMAGE_TAG|GH_RELEASE_TAG|GH_GIT_SHA|GH_IMAGE_DIGEST)=' .env > "\$ENV_TMP" || grep_status=\$?
+              else
+                grep -v '^IMAGE_TAG=' .env > "\$ENV_TMP" || grep_status=\$?
+              fi
               if [ "\$grep_status" -gt 1 ]; then
                 cleanup_env_tmp
                 return "\$grep_status"
@@ -297,6 +330,12 @@ jobs:
 
               if ! printf 'IMAGE_TAG=%s\n' "\$image_tag" >> "\$ENV_TMP"; then
                 return 1
+              fi
+              if [ "\$identity_enabled" = "true" ]; then
+                if ! printf 'GH_RELEASE_TAG=%s\nGH_GIT_SHA=%s\nGH_IMAGE_DIGEST=%s\n' \
+                  "\$release_tag" "\$git_sha" "\$image_digest" >> "\$ENV_TMP"; then
+                  return 1
+                fi
               fi
               if ! chmod 600 "\$ENV_TMP"; then
                 return 1
@@ -316,6 +355,40 @@ jobs:
                 return 1
               fi
             }
+
+            resolve_release_identity() {
+              local image_ref="\$1"
+              local release_tag="\$2"
+              local git_sha
+              local repo_digest
+              local image_digest
+
+              git_sha=\$(docker image inspect \
+                --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+                "\$image_ref")
+              repo_digest=\$(docker image inspect \
+                --format '{{ index .RepoDigests 0 }}' \
+                "\$image_ref")
+              image_digest="\${repo_digest##*@}"
+
+              if [[ ! "\$release_tag" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|sha-[0-9a-f]{7})$ ]]; then
+                echo "FAIL: invalid release identity tag"
+                return 1
+              fi
+              if [[ ! "\$git_sha" =~ ^[0-9a-f]{7,64}$ ]]; then
+                echo "FAIL: image is missing a valid OCI revision label"
+                return 1
+              fi
+              if [[ ! "\$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "FAIL: pulled image is missing a valid repository digest"
+                return 1
+              fi
+
+              GH_RELEASE_TAG="\$release_tag"
+              GH_GIT_SHA="\$git_sha"
+              GH_IMAGE_DIGEST="\$image_digest"
+              export GH_RELEASE_TAG GH_GIT_SHA GH_IMAGE_DIGEST
+            }
             # ENV_FILE_HARDENING_END
 
             trap 'status=\$?; cleanup_env_tmp; exit \$status' EXIT
@@ -326,12 +399,22 @@ jobs:
             echo "$GHCR_PULL_TOKEN" | docker login ghcr.io -u "$GH_OWNER" --password-stdin
 
             CURRENT=\$(docker compose images "$SERVICE" --quiet 2>/dev/null || true)
+            ROLLBACK_RELEASE_TAG=""
+            if [ "$RELEASE_IDENTITY_ENABLED" = "true" ]; then
+              if [ ! -f .env ] || [ -L .env ]; then
+                echo "FAIL: .env must be a regular non-symlink file"
+                exit 1
+              fi
+              ROLLBACK_RELEASE_TAG=\$(sed -n 's/^GH_RELEASE_TAG=//p' .env | tail -n 1)
+              if [ -z "\$ROLLBACK_RELEASE_TAG" ]; then
+                ROLLBACK_RELEASE_TAG=\$(sed -n 's/^IMAGE_TAG=//p' .env | tail -n 1)
+              fi
+            fi
             if [ -n "\$CURRENT" ]; then
               docker tag "\$CURRENT" "$IMAGE:rollback" || true
             fi
 
             export IMAGE_TAG="$TAG"
-            update_image_tag_env "\$IMAGE_TAG"
 
             EXTRA_SERVICES_EFFECTIVE="$EXTRA_SERVICES"
             if [ "$SERVICE" = "backend" ]; then
@@ -355,6 +438,12 @@ jobs:
 
             ALL_SERVICES="$SERVICE \$EXTRA_SERVICES_EFFECTIVE"
             docker compose pull \$ALL_SERVICES
+            if [ "$RELEASE_IDENTITY_ENABLED" = "true" ]; then
+              resolve_release_identity "$IMAGE:$TAG" "$TAG"
+              update_image_tag_env "\$IMAGE_TAG" "\$GH_RELEASE_TAG" "\$GH_GIT_SHA" "\$GH_IMAGE_DIGEST"
+            else
+              update_image_tag_env "\$IMAGE_TAG"
+            fi
 
             if [ -n "$MIGRATION_CMD" ]; then
               docker compose run -T --rm --no-deps "$SERVICE" $MIGRATION_CMD < /dev/null
@@ -636,7 +725,12 @@ jobs:
               local reason="\$1"
               echo "FAIL: \$reason -- auto-rolling back"
               export IMAGE_TAG=rollback
-              update_image_tag_env "\$IMAGE_TAG"
+              if [ "$RELEASE_IDENTITY_ENABLED" = "true" ]; then
+                resolve_release_identity "$IMAGE:rollback" "\$ROLLBACK_RELEASE_TAG"
+                update_image_tag_env "\$IMAGE_TAG" "\$GH_RELEASE_TAG" "\$GH_GIT_SHA" "\$GH_IMAGE_DIGEST"
+              else
+                update_image_tag_env "\$IMAGE_TAG"
+              fi
               docker compose up -d --no-build --force-recreate \$ALL_SERVICES
 
               PORT=\$(grep "^PORT=" .env | cut -d= -f2 | head -1)
