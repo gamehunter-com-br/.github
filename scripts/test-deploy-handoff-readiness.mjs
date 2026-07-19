@@ -21,6 +21,8 @@ const envHardeningStart = '# ENV_FILE_HARDENING_START';
 const envHardeningEnd = '# ENV_FILE_HARDENING_END';
 const protectedFlowStart = '# PROTECTED_RELEASE_FLOW_START';
 const protectedFlowEnd = '# PROTECTED_RELEASE_FLOW_END';
+const posixShellFixturesAvailable = process.platform !== 'win32' ||
+  process.env.GAMEHUNTER_FORCE_POSIX_FIXTURES === '1';
 
 class UpstreamPool {
   constructor(...servers) {
@@ -351,6 +353,20 @@ function assertProtectedModeContract() {
   assert.ok(deploy.includes('assert_protected_runtime_controls'));
   assert.ok(deploy.includes('protected release requires backend + workers with mandatory drain'));
   assert.ok(deploy.includes('effective protected policy mismatch'));
+  for (const countKey of [
+    'admin_responses',
+    'bullmq_matrix_checks',
+    'log_primary',
+    'log_error',
+    'log_stdout',
+  ]) {
+    assert.ok(
+      deploy.includes(countKey),
+      `protected telemetry canary gate must validate ${countKey}`,
+    );
+  }
+  assert.ok(deploy.includes('log_signals is not exactly three'));
+  assert.ok(deploy.includes('bullmq_matrix_checks is not exactly five'));
   assert.match(deploy, /recover_active_drain_id "\$PROTECTED_PREDECESSOR_RUN_ID"/);
   assert.match(deploy, /curl -fsS --connect-timeout 2 --max-time "\\\$max_time"/);
 
@@ -666,7 +682,7 @@ grep -qx 'IMAGE_TAG=must-fail-on-post-rename-symlink' .env.after-rename
 }
 
 function runRuntimePolicyFixture(workflow) {
-  if (process.platform === 'win32') return false;
+  if (!posixShellFixturesAvailable) return false;
 
   const start = workflow.indexOf('            assert_running_release_identity() {');
   const end = workflow.indexOf('\n\n            PROTECTED_MUTATED=false', start);
@@ -757,7 +773,7 @@ fi
 }
 
 function runProtectedFlowFixture(workflow) {
-  if (process.platform === 'win32') return false;
+  if (!posixShellFixturesAvailable) return false;
 
   const protectedBlock = extractProtectedFlowBlock(workflow);
   const fixtureDir = mkdtempSync(resolve(tmpdir(), 'gh-protected-flow-'));
@@ -859,7 +875,11 @@ docker() {
     record "MANIFEST_INSTANCES $manifest_instances"
     record "MANIFEST_FRESH true"
     if [ "$manifest_workers" != "$WORKER_FIXTURE_COUNT" ]; then return 1; fi
-    printf '%s\\n' '{"schema_version":"1","status":"passed","run_id":"run-fixture-001","counts":{"fetch_stub_calls":1,"vendor_calls":0,"subscriber_events":1,"redis_jobs":1,"postgres_rows":1,"log_signals":1,"sentry_error":1,"sentry_transaction":1,"sentry_span":1,"sentry_breadcrumb":1,"sentry_log":1,"raw_violations":0}}'
+    if [ "$FAIL_PHASE" = canary-counts ]; then
+      printf '%s\\n' '{"schema_version":"1","status":"passed","run_id":"run-fixture-001","counts":{"fetch_stub_calls":1,"vendor_calls":0,"subscriber_events":1,"redis_jobs":1,"postgres_rows":1,"admin_responses":0,"bullmq_matrix_checks":5,"log_signals":3,"log_primary":1,"log_error":1,"log_stdout":1,"sentry_error":1,"sentry_transaction":1,"sentry_span":1,"sentry_breadcrumb":1,"sentry_log":1,"raw_violations":0}}'
+    else
+      printf '%s\\n' '{"schema_version":"1","status":"passed","run_id":"run-fixture-001","counts":{"fetch_stub_calls":1,"vendor_calls":0,"subscriber_events":1,"redis_jobs":1,"postgres_rows":1,"admin_responses":1,"bullmq_matrix_checks":5,"log_signals":3,"log_primary":1,"log_error":1,"log_stdout":1,"sentry_error":1,"sentry_transaction":1,"sentry_span":1,"sentry_breadcrumb":1,"sentry_log":1,"raw_violations":0}}'
+    fi
   fi
 }
 resolve_release_identity() { record "RESOLVE $*"; }
@@ -1018,10 +1038,10 @@ if run_protected_release_flow; then
 fi
 sed -i 's/^FETCH_PROXY_MODE=tag$/FETCH_PROXY_MODE=disabled/' .env
 
-for phase in pull migration drain stop handoff health effective-env canary manifest-missing manifest-tampered manifest-preexisting manifest-stale worker-missing; do
+for phase in pull migration drain stop handoff health effective-env canary canary-counts manifest-missing manifest-tampered manifest-preexisting manifest-stale worker-missing; do
   failure_mode=protected-off
   case "$phase" in
-    canary|manifest-*|worker-missing) failure_mode=protected-on-bounded ;;
+    canary|canary-counts|manifest-*|worker-missing) failure_mode=protected-on-bounded ;;
   esac
   if run_case "$phase" "$failure_mode"; then
     echo "expected $failure_mode failure for $phase"
@@ -1029,7 +1049,7 @@ for phase in pull migration drain stop handoff health effective-env canary manif
   fi
   if grep -q ':rollback' "$LOG_FILE"; then exit 1; fi
   case "$phase" in
-    migration|stop|handoff|health|effective-env|canary|manifest-*|worker-missing)
+    migration|stop|handoff|health|effective-env|canary|canary-counts|manifest-*|worker-missing)
       grep -q '^UPDATE v9.9.9 v9.9.9 .* false disabled false$' "$LOG_FILE"
       ;;
   esac

@@ -1217,7 +1217,8 @@ jobs:
                 return 1
               fi
               for count_key in \
-                fetch_stub_calls subscriber_events redis_jobs postgres_rows log_signals \
+                fetch_stub_calls subscriber_events redis_jobs postgres_rows admin_responses \
+                log_primary log_error log_stdout \
                 sentry_error sentry_transaction sentry_span sentry_breadcrumb sentry_log; do
                 count_value=\$(printf '%s\n' "\$report" \
                   | sed -n "s/.*\"\${count_key}\":\([0-9][0-9]*\).*/\1/p")
@@ -1226,6 +1227,18 @@ jobs:
                   return 1
                 fi
               done
+              count_value=\$(printf '%s\n' "\$report" \
+                | sed -n 's/.*"log_signals":\([0-9][0-9]*\).*/\1/p')
+              if [ "\$count_value" != "3" ]; then
+                echo "FAIL: protected telemetry canary log_signals is not exactly three"
+                return 1
+              fi
+              count_value=\$(printf '%s\n' "\$report" \
+                | sed -n 's/.*"bullmq_matrix_checks":\([0-9][0-9]*\).*/\1/p')
+              if [ "\$count_value" != "5" ]; then
+                echo "FAIL: protected telemetry canary bullmq_matrix_checks is not exactly five"
+                return 1
+              fi
               for count_key in vendor_calls raw_violations; do
                 count_value=\$(printf '%s\n' "\$report" \
                   | sed -n "s/.*\"\${count_key}\":\([0-9][0-9]*\).*/\1/p")
