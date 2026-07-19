@@ -434,13 +434,20 @@ jobs:
                 echo "FAIL: protected rollback rejects a mixed capture policy"
                 return 1
               fi
+              PERSISTED_EXTERNAL_REQUEST_LOG="\$capture_enabled"
+              PERSISTED_FETCH_PROXY_MODE="\$fetch_proxy_mode"
+              PERSISTED_SENTRY_EGRESS="\$sentry_enabled"
             }
 
             assert_running_release_identity() {
               local image_ref="\$1"
               local expected_git_sha="\$2"
               local expected_image_digest="\$3"
+              local expected_external_request_log="\${4:-}"
+              local expected_fetch_proxy_mode="\${5:-}"
+              local expected_sentry_egress="\${6:-}"
               local expected_image_id running_service container_ids container_id running_image_id
+              local effective_env env_key env_key_count env_match_count expected_env
               local running_state running_revision target_repository candidate_digest digest_matches
               expected_image_id=\$(docker image inspect --format '{{.Id}}' "\$image_ref") || return 1
               target_repository="\${image_ref%:*}"
@@ -476,6 +483,25 @@ jobs:
                     echo "FAIL: service \$running_service digest mismatch"
                     return 1
                   }
+                  if [ -n "\$expected_external_request_log" ]; then
+                    effective_env=\$(docker inspect \
+                      --format '{{range .Config.Env}}{{println .}}{{end}}' \
+                      "\$container_id") || return 1
+                    for expected_env in \
+                      "EXTERNAL_REQUEST_LOG_ENABLED=\$expected_external_request_log" \
+                      "FETCH_PROXY_MODE=\$expected_fetch_proxy_mode" \
+                      "SENTRY_EGRESS_ENABLED=\$expected_sentry_egress"; do
+                      env_key="\${expected_env%%=*}"
+                      env_key_count=\$(printf '%s\n' "\$effective_env" \
+                        | grep -c "^\${env_key}=" || true)
+                      env_match_count=\$(printf '%s\n' "\$effective_env" \
+                        | grep -Fxc "\$expected_env" || true)
+                      if [ "\$env_key_count" -ne 1 ] || [ "\$env_match_count" -ne 1 ]; then
+                        echo "FAIL: service \$running_service effective protected policy mismatch for \$env_key"
+                        return 1
+                      fi
+                    done
+                  fi
                 done
               done
             }
@@ -536,7 +562,8 @@ jobs:
                 false disabled false || return 1
               docker compose up -d --no-build --force-recreate \$ALL_SERVICES || return 1
               assert_running_release_identity \
-                "${IMAGE}:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" || return 1
+                "${IMAGE}:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
+                false disabled false || return 1
             }
 
             trap 'status=\$?; cleanup_env_tmp; exit \$status' EXIT
@@ -546,12 +573,20 @@ jobs:
             export IMAGE_TAG="$TAG"
             ALL_SERVICES="$SERVICE $EXTRA_SERVICES"
             if [ "$ROLLBACK_MODE" = "protected-same-image-off" ]; then
+              NORMALIZED_SERVICES=\$(printf '%s\n' "\$ALL_SERVICES" | xargs)
+              if [ "$SERVICE" != "backend" ] \
+                || [ "\$NORMALIZED_SERVICES" != "backend workers" ]; then
+                echo "FAIL: protected rollback requires backend + workers"
+                exit 1
+              fi
               assert_persisted_release_identity
               docker pull "${IMAGE}:$TAG"
               resolve_release_identity \
                 "${IMAGE}:$TAG" "$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST"
               assert_running_release_identity \
-                "${IMAGE}:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST"
+                "${IMAGE}:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
+                "\$PERSISTED_EXTERNAL_REQUEST_LOG" "\$PERSISTED_FETCH_PROXY_MODE" \
+                "\$PERSISTED_SENTRY_EGRESS"
               ensure_worker_queue_paused
               if ! force_same_image_capture_off; then
                 echo "FAIL: protected rollback failed; retrying same-image capture-off containment"
@@ -564,7 +599,8 @@ jobs:
               PORT=\$(grep "^PORT=" .env | cut -d= -f2 | head -1)
               PORT=\${PORT:-$DEFAULT_PORT}
               for i in \$(seq 1 30); do
-                if curl -fsS "http://localhost:\$PORT$HEALTH_PATH" > /dev/null 2>&1; then
+                if curl -fsS --connect-timeout 2 --max-time 8 \
+                  "http://localhost:\$PORT$HEALTH_PATH" > /dev/null 2>&1; then
                   echo "OK Protected same-image capture-off rollback to $TAG; queue remains paused"
                   docker logout ghcr.io
                   exit 0
@@ -589,7 +625,8 @@ jobs:
             PORT=\$(grep "^PORT=" .env | cut -d= -f2 | head -1)
             PORT=\${PORT:-$DEFAULT_PORT}
             for i in \$(seq 1 30); do
-              if curl -fsS "http://localhost:\$PORT$HEALTH_PATH" > /dev/null 2>&1; then
+              if curl -fsS --connect-timeout 2 --max-time 8 \
+                "http://localhost:\$PORT$HEALTH_PATH" > /dev/null 2>&1; then
                 echo "OK Rollback to $TAG"
                 docker logout ghcr.io
                 exit 0

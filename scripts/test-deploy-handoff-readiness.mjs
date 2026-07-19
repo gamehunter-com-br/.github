@@ -331,6 +331,7 @@ function assertProtectedModeContract() {
   }
   assert.ok(deploy.includes('expected-git-sha'));
   assert.ok(deploy.includes('expected-image-digest'));
+  assert.ok(deploy.includes('protected-predecessor-run-id'));
   assert.ok(deploy.includes('PROTECTED_RELEASE_FLOW_START'));
   assert.ok(deploy.includes('PROTECTED_RELEASE_FLOW_END'));
   assert.ok(deploy.includes('assert_running_release_identity'));
@@ -347,6 +348,11 @@ function assertProtectedModeContract() {
   assert.ok(deploy.includes("date -u +'%Y-%m-%dT%H:%M:%S.%3NZ'"));
   assert.ok(deploy.includes('protected capture-on requires a proven capture-off predecessor'));
   assert.ok(deploy.includes('active drain is stale or belongs to another release'));
+  assert.ok(deploy.includes('assert_protected_runtime_controls'));
+  assert.ok(deploy.includes('protected release requires backend + workers with mandatory drain'));
+  assert.ok(deploy.includes('effective protected policy mismatch'));
+  assert.match(deploy, /recover_active_drain_id "\$PROTECTED_PREDECESSOR_RUN_ID"/);
+  assert.match(deploy, /curl -fsS --connect-timeout 2 --max-time "\\\$max_time"/);
 
   const protectedOnStart = deploy.indexOf('protected-on-bounded)');
   const protectedOnPersisted = deploy.indexOf('assert_persisted_release_identity', protectedOnStart);
@@ -361,6 +367,16 @@ function assertProtectedModeContract() {
   );
 
   const protectedBlock = extractProtectedFlowBlock(deploy);
+  const protectedOffStart = protectedBlock.indexOf('protected-off)');
+  const protectedOffMutation = protectedBlock.indexOf(
+    'PROTECTED_MUTATED=true',
+    protectedOffStart,
+  );
+  const protectedOffStop = protectedBlock.indexOf('docker compose stop', protectedOffStart);
+  assert.ok(
+    protectedOffMutation > protectedOffStart && protectedOffMutation < protectedOffStop,
+    'protected-off must enter containment before the first stop can partially mutate runtime',
+  );
   const forceStart = protectedBlock.indexOf('force_same_image_capture_off()');
   const forceEnd = protectedBlock.indexOf('ensure_protected_queue_paused()', forceStart);
   const forceBlock = protectedBlock.slice(forceStart, forceEnd);
@@ -375,6 +391,8 @@ function assertProtectedModeContract() {
   assert.ok(rollback.includes('expected-image-digest'));
   assert.ok(rollback.includes('assert_running_release_identity'));
   assert.ok(rollback.includes('protected rollback rejects a mixed capture policy'));
+  assert.ok(rollback.includes('effective protected policy mismatch'));
+  assert.ok(rollback.includes('protected rollback requires backend + workers'));
   assert.ok(rollback.includes('recovered_image_tag'));
   const protectedRollbackStart = rollback.lastIndexOf(
     'if [ "$ROLLBACK_MODE" = "protected-same-image-off" ]; then',
@@ -647,6 +665,97 @@ grep -qx 'IMAGE_TAG=must-fail-on-post-rename-symlink' .env.after-rename
   return true;
 }
 
+function runRuntimePolicyFixture(workflow) {
+  if (process.platform === 'win32') return false;
+
+  const start = workflow.indexOf('            assert_running_release_identity() {');
+  const end = workflow.indexOf('\n\n            PROTECTED_MUTATED=false', start);
+  assert.ok(start > -1 && end > start, 'deploy runtime identity function must be extractable');
+  const identityFunction = workflow
+    .slice(start, end)
+    .replace(/^ {12}/gm, '')
+    .replace(/\\\$/g, () => '$');
+  const fixtureDir = mkdtempSync(resolve(tmpdir(), 'gh-runtime-policy-'));
+  const fixturePath = resolve(fixtureDir, 'fixture.sh');
+  const script = `#!/usr/bin/env bash
+set -euo pipefail
+ALL_SERVICES='backend workers'
+BAD_SERVICE=''
+DUPLICATE_KEY=false
+EXPECTED_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+EXPECTED_DIGEST=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+IMAGE_ID=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+
+docker() {
+  if [[ "$*" == 'image inspect --format {{.Id}} '* ]]; then
+    printf '%s\\n' "$IMAGE_ID"
+  elif [[ "$*" == 'compose ps -q backend' ]]; then
+    printf '%s\\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  elif [[ "$*" == 'compose ps -q workers' ]]; then
+    printf '%s\\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  elif [[ "$*" == *'inspect --format {{.State.Running}}'* ]]; then
+    printf '%s\\n' true
+  elif [[ "$*" == *'inspect --format {{.Image}}'* ]]; then
+    printf '%s\\n' "$IMAGE_ID"
+  elif [[ "$*" == *'image inspect --format {{ index .Config.Labels'* ]]; then
+    printf '%s\\n' "$EXPECTED_SHA"
+  elif [[ "$*" == *'image inspect --format {{range .RepoDigests}}'* ]]; then
+    printf '%s\\n' "ghcr.io/gamehunter-com-br/backend@$EXPECTED_DIGEST"
+  elif [[ "$*" == *'inspect --format {{range .Config.Env}}'* ]]; then
+    container_id="\${*: -1}"
+    external=false
+    if [ "$BAD_SERVICE" = workers ] && [[ "$container_id" == b* ]]; then external=true; fi
+    printf '%s\\n' \
+      "EXTERNAL_REQUEST_LOG_ENABLED=$external" \
+      'FETCH_PROXY_MODE=disabled' \
+      'SENTRY_EGRESS_ENABLED=false'
+    if [ "$DUPLICATE_KEY" = true ]; then
+      printf '%s\\n' 'FETCH_PROXY_MODE=tag'
+    fi
+  else
+    return 1
+  fi
+}
+
+${identityFunction}
+
+assert_running_release_identity \
+  ghcr.io/gamehunter-com-br/backend:v9.9.9 "$EXPECTED_SHA" "$EXPECTED_DIGEST" \
+  false disabled false
+BAD_SERVICE=workers
+if assert_running_release_identity \
+  ghcr.io/gamehunter-com-br/backend:v9.9.9 "$EXPECTED_SHA" "$EXPECTED_DIGEST" \
+  false disabled false >/dev/null 2>&1; then
+  echo 'expected effective worker policy mismatch'
+  exit 1
+fi
+BAD_SERVICE=''
+DUPLICATE_KEY=true
+if assert_running_release_identity \
+  ghcr.io/gamehunter-com-br/backend:v9.9.9 "$EXPECTED_SHA" "$EXPECTED_DIGEST" \
+  false disabled false >/dev/null 2>&1; then
+  echo 'expected duplicate effective policy key to fail closed'
+  exit 1
+fi
+`;
+
+  try {
+    writeFileSync(fixturePath, script, { mode: 0o700 });
+    const result = spawnSync('bash', [fixturePath], {
+      cwd: fixtureDir,
+      encoding: 'utf8',
+    });
+    assert.equal(
+      result.status,
+      0,
+      `runtime policy POSIX fixture failed:\n${result.stdout}${result.stderr}`,
+    );
+  } finally {
+    rmSync(fixtureDir, { force: true, recursive: true });
+  }
+  return true;
+}
+
 function runProtectedFlowFixture(workflow) {
   if (process.platform === 'win32') return false;
 
@@ -672,15 +781,21 @@ IMAGE=ghcr.io/gamehunter-com-br/backend
 SERVICE=backend
 DEPLOY_RUN_ID=10001
 ALL_SERVICES='backend workers'
+DEPLOY_WORKERS=true
+WORKER_DRAIN_ENABLED=true
 MIGRATION_CMD='npm run migrate'
 DEFAULT_PORT=3001
 HEALTH_PATH=/health
 PROTECTED_BOUNDED_SECONDS=0
 PROTECTED_CANARY_OPERATOR=github-actions-fixture
+PROTECTED_PREDECESSOR_RUN_ID=10001
 WORKER_DRAIN_ID=''
+WORKER_DRAIN_DEPLOY_REF=''
 SHOULD_DRAIN_WORKERS=true
 FAIL_PHASE=none
 STATUS_TAG=v9.9.9
+STATUS_DEPLOY_REF=10001
+STOP_FAILURES_REMAINING=0
 WORKER_FIXTURE_COUNT=1
 LOG_FILE="$PWD/operations.log"
 record() { printf '%s\\n' "$*" >> "$LOG_FILE"; }
@@ -688,9 +803,13 @@ docker() {
   record "DOCKER $*"
   if [ "$1" = pull ] && [ "$FAIL_PHASE" = pull ]; then return 1; fi
   if [[ "$*" == *'compose run'*'npm run migrate'* ]] && [ "$FAIL_PHASE" = migration ]; then return 1; fi
+  if [[ "$*" == *'compose stop'* ]] && [ "$STOP_FAILURES_REMAINING" -gt 0 ]; then
+    STOP_FAILURES_REMAINING=$((STOP_FAILURES_REMAINING - 1))
+    return 1
+  fi
   if [[ "$*" == *'compose up'* ]] && [ "$FAIL_PHASE" = handoff ]; then return 1; fi
   if [[ "$*" == *'deploy:workers:status'* ]]; then
-    printf '%s\\n' '{"queue":{"name":"scheduled-jobs","paused":true,"pause_reason":"deploy_drain"},"active_drain":{"id":"drain-fixture-0001","deploy_ref":"10001","image_tag":"'"$STATUS_TAG"'","status":"ready"},"active_jobs":[],"recent_drains":[],"orphan_pause":false}'
+    printf '%s\\n' '{"queue":{"name":"scheduled-jobs","paused":true,"pause_reason":"deploy_drain"},"active_drain":{"id":"drain-fixture-0001","deploy_ref":"'"$STATUS_DEPLOY_REF"'","image_tag":"'"$STATUS_TAG"'","status":"ready"},"active_jobs":[],"recent_drains":[],"orphan_pause":false}'
   fi
   if [[ "$*" == *'image inspect --format {{.Id}}'* ]]; then
     printf '%s\\n' 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
@@ -745,7 +864,10 @@ docker() {
 }
 resolve_release_identity() { record "RESOLVE $*"; }
 update_image_tag_env() { record "UPDATE $*"; }
-assert_running_release_identity() { record "ASSERT_RUNNING $*"; }
+assert_running_release_identity() {
+  record "ASSERT_RUNNING $*"
+  [ "$FAIL_PHASE" != effective-env ]
+}
 assert_persisted_release_identity() { record 'ASSERT_PERSISTED'; }
 start_worker_drain() {
   record 'PAUSE_QUEUE'
@@ -767,7 +889,10 @@ ${protectedBlock}
 
 # The fixture exercises the protected gates and substitutes only container
 # identity inspection, which has its own executable env/identity fixture.
-assert_running_release_identity() { record "ASSERT_RUNNING $*"; }
+assert_running_release_identity() {
+  record "ASSERT_RUNNING $*"
+  [ "$FAIL_PHASE" != effective-env ]
+}
 
 run_case() {
   local phase="$1" mode="$2" run_status=0 containment_status=0
@@ -775,12 +900,19 @@ run_case() {
   FAIL_PHASE="$phase"
   CUTOVER_MODE="$mode"
   WORKER_DRAIN_ID=''
+  WORKER_DRAIN_DEPLOY_REF=''
   PROTECTED_MUTATED=false
   PROTECTED_IDENTITY_VERIFIED=false
   PROTECTED_QUEUE_PAUSED=false
   STATUS_TAG=v9.9.9
+  STATUS_DEPLOY_REF=10001
+  STOP_FAILURES_REMAINING=0
+  DEPLOY_WORKERS=true
+  WORKER_DRAIN_ENABLED=true
+  SHOULD_DRAIN_WORKERS=true
   WORKER_FIXTURE_COUNT=1
   if [ "$phase" = worker-missing ]; then WORKER_FIXTURE_COUNT=0; fi
+  if [ "$phase" = stop ]; then STOP_FAILURES_REMAINING=1; fi
   if run_protected_release_flow; then
     run_status=0
   else
@@ -807,6 +939,8 @@ grep -q '^DOCKER compose run .*deploy:workers:status.*--json$' "$LOG_FILE"
 grep -q '^UPDATE v9.9.9 v9.9.9 .* true tag true$' "$LOG_FILE"
 grep -q '^DOCKER exec .*external-request-telemetry:canary.*--approved-spec=F1-513.*--confirm-high=run-protected-telemetry-canary.*--operator=github-actions-fixture.*--json$' "$LOG_FILE"
 test "$(grep -c '^RESUME_QUEUE$' "$LOG_FILE")" = 1
+grep -q '^ASSERT_RUNNING .* false disabled false$' "$LOG_FILE"
+grep -q '^ASSERT_RUNNING .* true tag true$' "$LOG_FILE"
 
 WORKER_FIXTURE_COUNT=2
 : > "$LOG_FILE"
@@ -831,6 +965,48 @@ fi
 if grep -q '^UPDATE .* true tag true$' "$LOG_FILE"; then exit 1; fi
 STATUS_TAG=v9.9.9
 
+: > "$LOG_FILE"
+STATUS_DEPLOY_REF=99999
+PROTECTED_MUTATED=false
+PROTECTED_IDENTITY_VERIFIED=false
+PROTECTED_QUEUE_PAUSED=false
+if run_protected_release_flow; then
+  echo 'expected protected-on to reject a drain from another protected-off run'
+  exit 1
+fi
+if grep -q '^UPDATE .* true tag true$' "$LOG_FILE"; then exit 1; fi
+STATUS_DEPLOY_REF=10001
+
+: > "$LOG_FILE"
+CUTOVER_MODE=protected-off
+DEPLOY_WORKERS=false
+SHOULD_DRAIN_WORKERS=false
+PROTECTED_MUTATED=false
+PROTECTED_IDENTITY_VERIFIED=false
+PROTECTED_QUEUE_PAUSED=false
+if run_protected_release_flow; then
+  echo 'expected protected-off to require workers and drain'
+  exit 1
+fi
+if grep -q '^DOCKER pull ' "$LOG_FILE"; then exit 1; fi
+DEPLOY_WORKERS=true
+SHOULD_DRAIN_WORKERS=true
+
+: > "$LOG_FILE"
+WORKER_DRAIN_ENABLED=false
+SHOULD_DRAIN_WORKERS=false
+PROTECTED_MUTATED=false
+PROTECTED_IDENTITY_VERIFIED=false
+PROTECTED_QUEUE_PAUSED=false
+if run_protected_release_flow; then
+  echo 'expected protected-off to reject disabled worker drain'
+  exit 1
+fi
+if grep -q '^DOCKER pull ' "$LOG_FILE"; then exit 1; fi
+WORKER_DRAIN_ENABLED=true
+SHOULD_DRAIN_WORKERS=true
+
+CUTOVER_MODE=protected-on-bounded
 sed -i 's/^FETCH_PROXY_MODE=disabled$/FETCH_PROXY_MODE=tag/' .env
 : > "$LOG_FILE"
 PROTECTED_MUTATED=false
@@ -842,7 +1018,7 @@ if run_protected_release_flow; then
 fi
 sed -i 's/^FETCH_PROXY_MODE=tag$/FETCH_PROXY_MODE=disabled/' .env
 
-for phase in pull migration drain handoff health canary manifest-missing manifest-tampered manifest-preexisting manifest-stale worker-missing; do
+for phase in pull migration drain stop handoff health effective-env canary manifest-missing manifest-tampered manifest-preexisting manifest-stale worker-missing; do
   failure_mode=protected-off
   case "$phase" in
     canary|manifest-*|worker-missing) failure_mode=protected-on-bounded ;;
@@ -853,7 +1029,7 @@ for phase in pull migration drain handoff health canary manifest-missing manifes
   fi
   if grep -q ':rollback' "$LOG_FILE"; then exit 1; fi
   case "$phase" in
-    migration|handoff|health|canary|manifest-*|worker-missing)
+    migration|stop|handoff|health|effective-env|canary|manifest-*|worker-missing)
       grep -q '^UPDATE v9.9.9 v9.9.9 .* false disabled false$' "$LOG_FILE"
       ;;
   esac
@@ -908,6 +1084,7 @@ const functionalFixtureRan = [
   runEnvHardeningFixture('deploy workflow', deployEnv.hardeningBlock),
   runEnvHardeningFixture('rollback workflow', rollbackEnv.hardeningBlock),
 ].some(Boolean);
+const runtimePolicyFixtureRan = runRuntimePolicyFixture(deployEnv.workflow);
 const protectedFixtureRan = runProtectedFlowFixture(deployEnv.workflow);
 
 console.log('deploy handoff readiness fixture PASS');
@@ -916,6 +1093,11 @@ console.log(
   functionalFixtureRan
     ? 'deploy/rollback env hardening mode fixture PASS'
     : 'deploy/rollback env hardening mode fixture SKIP (requires POSIX chmod semantics)',
+);
+console.log(
+  runtimePolicyFixtureRan
+    ? 'protected runtime effective-policy fixture PASS'
+    : 'protected runtime effective-policy fixture SKIP (requires POSIX shell)',
 );
 console.log(
   protectedFixtureRan

@@ -88,6 +88,11 @@ on:
         required: false
         default: '60'
         type: string
+      protected-predecessor-run-id:
+        description: 'Run ID exato do protected-off; obrigatorio no protected-on-bounded'
+        required: false
+        default: ''
+        type: string
       migration-cmd:
         description: 'Comando de migration (ex: npm run migrate). Vazio pula.'
         required: false
@@ -141,6 +146,7 @@ jobs:
           EXPECTED_GIT_SHA_INPUT: ${{ inputs.expected-git-sha }}
           EXPECTED_IMAGE_DIGEST_INPUT: ${{ inputs.expected-image-digest }}
           PROTECTED_BOUNDED_SECONDS_INPUT: ${{ inputs.protected-bounded-seconds }}
+          PROTECTED_PREDECESSOR_RUN_ID_INPUT: ${{ inputs.protected-predecessor-run-id }}
           RELEASE_IDENTITY_ENABLED: ${{ inputs.release-identity-enabled }}
         run: |
           set -euo pipefail
@@ -210,6 +216,20 @@ jobs:
             echo "::error::protected-bounded-seconds deve ficar entre 10 e 300"
             exit 1
           fi
+          case "$CUTOVER_MODE" in
+            protected-on-bounded)
+              if [[ ! "$PROTECTED_PREDECESSOR_RUN_ID_INPUT" =~ ^[0-9]{1,20}$ ]]; then
+                echo "::error::protected-on-bounded exige o run ID exato do protected-off"
+                exit 1
+              fi
+              ;;
+            standard|protected-off)
+              if [ -n "$PROTECTED_PREDECESSOR_RUN_ID_INPUT" ]; then
+                echo "::error::protected-predecessor-run-id so e aceito no protected-on-bounded"
+                exit 1
+              fi
+              ;;
+          esac
           CANARY_OPERATOR="github-actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           if [[ ! "$CANARY_OPERATOR" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$ ]]; then
             echo "::error::Nao foi possivel gerar o identificador tecnico do canario"
@@ -220,6 +240,7 @@ jobs:
           echo "git_sha=${RESOLVED_GIT_SHA}" >> $GITHUB_OUTPUT
           echo "image_digest=${EXPECTED_IMAGE_DIGEST_INPUT}" >> $GITHUB_OUTPUT
           echo "canary_operator=${CANARY_OPERATOR}" >> $GITHUB_OUTPUT
+          echo "protected_predecessor_run_id=${PROTECTED_PREDECESSOR_RUN_ID_INPUT}" >> $GITHUB_OUTPUT
 
       - name: Resolve worker deploy mode
         id: worker-mode
@@ -307,6 +328,7 @@ jobs:
           EXPECTED_GIT_SHA: ${{ steps.tag.outputs.git_sha }}
           EXPECTED_IMAGE_DIGEST: ${{ steps.tag.outputs.image_digest }}
           PROTECTED_BOUNDED_SECONDS: ${{ inputs.protected-bounded-seconds }}
+          PROTECTED_PREDECESSOR_RUN_ID: ${{ steps.tag.outputs.protected_predecessor_run_id }}
           PROTECTED_CANARY_OPERATOR: ${{ steps.tag.outputs.canary_operator }}
           DEPLOY_RUN_ID: ${{ github.run_id }}
           MIGRATION_CMD: ${{ inputs.migration-cmd }}
@@ -619,7 +641,8 @@ jobs:
             if [ "\$PUBLIC_ATTEMPTS" -lt 1 ]; then PUBLIC_ATTEMPTS=1; fi
 
             public_readiness_ok() {
-              local check host path
+              local absolute_deadline="\${1:-0}"
+              local check host path max_time remaining
               for check in \$PUBLIC_CHECKS; do
                 host="\${check%%:*}"
                 path="\${check#*:}"
@@ -627,7 +650,16 @@ jobs:
                   echo "Invalid public readiness check: \$check"
                   return 1
                 fi
-                curl -fsS --connect-timeout 2 --max-time 8 \
+                max_time=8
+                if [ "\$absolute_deadline" -gt 0 ]; then
+                  remaining=\$((absolute_deadline - SECONDS))
+                  if [ "\$remaining" -le 0 ]; then
+                    echo "FAIL: protected readiness matrix exceeded its deadline"
+                    return 1
+                  fi
+                  if [ "\$remaining" -lt "\$max_time" ]; then max_time="\$remaining"; fi
+                fi
+                curl -fsS --connect-timeout 2 --max-time "\$max_time" \
                   --resolve "\$host:443:127.0.0.1" \
                   "https://\$host\$path" > /dev/null || return 1
               done
@@ -639,7 +671,8 @@ jobs:
               local label="\$2"
               echo "Health check em localhost:\$port$HEALTH_PATH (\$label)"
               for i in \$(seq 1 30); do
-                if curl -fsS "http://localhost:\$port$HEALTH_PATH" > /dev/null 2>&1; then
+                if curl -fsS --connect-timeout 2 --max-time 8 \
+                  "http://localhost:\$port$HEALTH_PATH" > /dev/null 2>&1; then
                   echo "OK $SERVICE local health on \$label"
                   return 0
                 fi
@@ -709,6 +742,7 @@ jobs:
             }
 
             WORKER_DRAIN_ID=""
+            WORKER_DRAIN_DEPLOY_REF=""
             HANDOFF_CANDIDATE_CONTAINER=""
             HANDOFF_CANDIDATE_PORT=""
             HANDOFF_MARKER=""
@@ -724,6 +758,7 @@ jobs:
                   --reason "\$reason" \
                   --json < /dev/null; then
                   WORKER_DRAIN_ID=""
+                  WORKER_DRAIN_DEPLOY_REF=""
                 elif [ "\$strict" = "true" ]; then
                   return 1
                 fi
@@ -732,6 +767,10 @@ jobs:
 
             start_worker_drain() {
               if [ "\$SHOULD_DRAIN_WORKERS" != "true" ]; then
+                if [ "$CUTOVER_MODE" != "standard" ]; then
+                  echo "FAIL: protected backend release requires workers and deploy drain"
+                  return 1
+                fi
                 return 0
               fi
               local created_drain_id
@@ -753,7 +792,7 @@ jobs:
                 return 1
               fi
               created_drain_id="\$WORKER_DRAIN_ID"
-              recover_active_drain_id || return 1
+              recover_active_drain_id "$DEPLOY_RUN_ID" || return 1
               if [ "\$WORKER_DRAIN_ID" != "\$created_drain_id" ]; then
                 echo "FAIL: active drain changed during deploy handoff"
                 return 1
@@ -761,7 +800,21 @@ jobs:
             }
 
             # PROTECTED_RELEASE_FLOW_START
+            assert_protected_runtime_controls() {
+              local normalized_services
+              normalized_services=\$(printf '%s\n' "\$ALL_SERVICES" | xargs)
+              if [ "$SERVICE" != "backend" ] \
+                || [ "$DEPLOY_WORKERS" != "true" ] \
+                || [ "$WORKER_DRAIN_ENABLED" != "true" ] \
+                || [ "\$SHOULD_DRAIN_WORKERS" != "true" ] \
+                || [ "\$normalized_services" != "backend workers" ]; then
+                echo "FAIL: protected release requires backend + workers with mandatory drain"
+                return 1
+              fi
+            }
+
             recover_active_drain_id() {
+              local expected_deploy_ref="\$1"
               local active_drain_json
               local deploy_ref
               local queue_json
@@ -789,7 +842,8 @@ jobs:
                 echo "FAIL: protected release requires one active deploy drain"
                 return 1
               fi
-              if [[ ! "\$deploy_ref" =~ ^[A-Za-z0-9._:-]{1,128}$ ]] \
+              if [[ ! "\$expected_deploy_ref" =~ ^[0-9]{1,20}$ ]] \
+                || [ "\$deploy_ref" != "\$expected_deploy_ref" ] \
                 || [ "\$recovered_image_tag" != "$TAG" ] \
                 || [ "\$recovered_status" != "ready" ]; then
                 echo "FAIL: active drain is stale or belongs to another release"
@@ -803,6 +857,7 @@ jobs:
                   ;;
               esac
               WORKER_DRAIN_ID="\$recovered_id"
+              WORKER_DRAIN_DEPLOY_REF="\$deploy_ref"
             }
 
             read_single_env_value() {
@@ -849,10 +904,18 @@ jobs:
               local image_ref="\$1"
               local expected_git_sha="\$2"
               local expected_image_digest="\$3"
+              local expected_external_request_log="\${4:-}"
+              local expected_fetch_proxy_mode="\${5:-}"
+              local expected_sentry_egress="\${6:-}"
               local expected_image_id
               local running_service
               local container_ids
               local container_id
+              local effective_env
+              local env_key
+              local env_key_count
+              local env_match_count
+              local expected_env
               local running_image_id
               local running_state
               local running_revision
@@ -893,6 +956,25 @@ jobs:
                   if [ "\$digest_matches" -ne 1 ]; then
                     echo "FAIL: service \$running_service digest mismatch"
                     return 1
+                  fi
+                  if [ -n "\$expected_external_request_log" ]; then
+                    effective_env=\$(docker inspect \
+                      --format '{{range .Config.Env}}{{println .}}{{end}}' \
+                      "\$container_id") || return 1
+                    for expected_env in \
+                      "EXTERNAL_REQUEST_LOG_ENABLED=\$expected_external_request_log" \
+                      "FETCH_PROXY_MODE=\$expected_fetch_proxy_mode" \
+                      "SENTRY_EGRESS_ENABLED=\$expected_sentry_egress"; do
+                      env_key="\${expected_env%%=*}"
+                      env_key_count=\$(printf '%s\n' "\$effective_env" \
+                        | grep -c "^\${env_key}=" || true)
+                      env_match_count=\$(printf '%s\n' "\$effective_env" \
+                        | grep -Fxc "\$expected_env" || true)
+                      if [ "\$env_key_count" -ne 1 ] || [ "\$env_match_count" -ne 1 ]; then
+                        echo "FAIL: service \$running_service effective protected policy mismatch for \$env_key"
+                        return 1
+                      fi
+                    done
                   fi
                 done
               done
@@ -1017,7 +1099,8 @@ jobs:
                 false disabled false || return 1
               docker compose up -d --no-build --force-recreate \$ALL_SERVICES || return 1
               assert_running_release_identity \
-                "$IMAGE:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" || return 1
+                "$IMAGE:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
+                false disabled false || return 1
               PORT=\$(grep '^PORT=' .env | cut -d= -f2 | head -1)
               PORT=\${PORT:-$DEFAULT_PORT}
               wait_local_health "\$PORT" "protected same-image capture-off" || return 1
@@ -1025,15 +1108,22 @@ jobs:
             }
 
             ensure_protected_queue_paused() {
+              local expected_deploy_ref="\$WORKER_DRAIN_DEPLOY_REF"
               if [ "\$SHOULD_DRAIN_WORKERS" != "true" ]; then
                 echo "FAIL: protected backend release requires worker drain"
                 return 1
               fi
-              if recover_active_drain_id >/dev/null 2>&1; then
+              if [ -z "\$expected_deploy_ref" ] \
+                && [ "$CUTOVER_MODE" = "protected-on-bounded" ]; then
+                expected_deploy_ref="$PROTECTED_PREDECESSOR_RUN_ID"
+              fi
+              if [ -n "\$expected_deploy_ref" ] \
+                && recover_active_drain_id "\$expected_deploy_ref" >/dev/null 2>&1; then
                 PROTECTED_QUEUE_PAUSED=true
                 return 0
               fi
               WORKER_DRAIN_ID=""
+              WORKER_DRAIN_DEPLOY_REF=""
               start_worker_drain || return 1
               PROTECTED_QUEUE_PAUSED=true
             }
@@ -1149,19 +1239,28 @@ jobs:
 
             bounded_protected_canary() {
               local deadline
+              local max_time
               local port
+              local remaining
               echo "Starting bounded protected canary for $PROTECTED_BOUNDED_SECONDS seconds"
               port=\$(grep '^PORT=' .env | cut -d= -f2 | head -1)
               port=\${port:-$DEFAULT_PORT}
               deadline=\$((SECONDS + $PROTECTED_BOUNDED_SECONDS))
               while [ "\$SECONDS" -lt "\$deadline" ]; do
-                curl -fsS "http://localhost:\$port$HEALTH_PATH" > /dev/null 2>&1 || return 1
-                public_readiness_ok || return 1
-                sleep 2
+                remaining=\$((deadline - SECONDS))
+                max_time=8
+                if [ "\$remaining" -lt "\$max_time" ]; then max_time="\$remaining"; fi
+                curl -fsS --connect-timeout 2 --max-time "\$max_time" \
+                  "http://localhost:\$port$HEALTH_PATH" > /dev/null 2>&1 || return 1
+                public_readiness_ok "\$deadline" || return 1
+                remaining=\$((deadline - SECONDS))
+                if [ "\$remaining" -le 0 ]; then break; fi
+                if [ "\$remaining" -lt 2 ]; then sleep "\$remaining"; else sleep 2; fi
               done
             }
 
             run_protected_release_flow() {
+              assert_protected_runtime_controls || return 1
               docker pull "$IMAGE:$TAG" || return 1
               resolve_release_identity \
                 "$IMAGE:$TAG" "$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" || return 1
@@ -1171,8 +1270,8 @@ jobs:
                 protected-off)
                   start_worker_drain || return 1
                   PROTECTED_QUEUE_PAUSED=true
-                  docker compose stop \$ALL_SERVICES || return 1
                   PROTECTED_MUTATED=true
+                  docker compose stop \$ALL_SERVICES || return 1
                   update_image_tag_env \
                     "$TAG" "$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
                     false disabled false || return 1
@@ -1182,7 +1281,8 @@ jobs:
                   fi
                   docker compose up -d --no-build --force-recreate \$ALL_SERVICES || return 1
                   assert_running_release_identity \
-                    "$IMAGE:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" || return 1
+                    "$IMAGE:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
+                    false disabled false || return 1
                   PORT=\$(grep '^PORT=' .env | cut -d= -f2 | head -1)
                   PORT=\${PORT:-$DEFAULT_PORT}
                   wait_local_health "\$PORT" "protected capture-off" || return 1
@@ -1192,8 +1292,9 @@ jobs:
                 protected-on-bounded)
                   assert_persisted_release_identity || return 1
                   assert_running_release_identity \
-                    "$IMAGE:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" || return 1
-                  recover_active_drain_id || return 1
+                    "$IMAGE:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
+                    false disabled false || return 1
+                  recover_active_drain_id "$PROTECTED_PREDECESSOR_RUN_ID" || return 1
                   PROTECTED_QUEUE_PAUSED=true
                   update_image_tag_env \
                     "$TAG" "$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
@@ -1201,7 +1302,8 @@ jobs:
                   PROTECTED_MUTATED=true
                   docker compose up -d --no-build --force-recreate \$ALL_SERVICES || return 1
                   assert_running_release_identity \
-                    "$IMAGE:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" || return 1
+                    "$IMAGE:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
+                    true tag true || return 1
                   PORT=\$(grep '^PORT=' .env | cut -d= -f2 | head -1)
                   PORT=\${PORT:-$DEFAULT_PORT}
                   wait_local_health "\$PORT" "protected capture-on" || return 1
@@ -1453,6 +1555,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- Image: \`${{ steps.tag.outputs.image }}:${{ steps.tag.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Cutover: \`${{ inputs.cutover-mode }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Current run ID: \`${{ github.run_id }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Protected-off predecessor run: \`${{ inputs.protected-predecessor-run-id || 'n/a' }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Git SHA: \`${{ steps.tag.outputs.git_sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Digest esperado: \`${{ steps.tag.outputs.image_digest }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- VPS: ${{ inputs.vps-host }} (${{ inputs.vps-path }})" >> $GITHUB_STEP_SUMMARY
