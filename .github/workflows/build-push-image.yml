@@ -34,6 +34,19 @@ on:
       SENTRY_AUTH_TOKEN:
         description: 'Sentry auth token (project:releases) pra upload de sourcemaps no build. Opcional; vazio = sem upload (withSentryConfig fica silent, build segue verde).'
         required: false
+    outputs:
+      image:
+        description: 'Normalized GHCR image repository'
+        value: ${{ jobs.build_push.outputs.image }}
+      image_tag:
+        description: 'Primary image tag published by this run'
+        value: ${{ jobs.build_push.outputs.image_tag }}
+      git_sha:
+        description: 'Full Git commit recorded in the OCI image'
+        value: ${{ jobs.build_push.outputs.git_sha }}
+      image_digest:
+        description: 'Immutable sha256 registry digest of the primary tag'
+        value: ${{ jobs.build_push.outputs.image_digest }}
 
 permissions:
   contents: read
@@ -44,8 +57,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-push:
+  build_push:
     runs-on: ${{ inputs.runner }}
+    outputs:
+      image: ${{ steps.published-identity.outputs.image }}
+      image_tag: ${{ steps.published-identity.outputs.image_tag }}
+      git_sha: ${{ steps.published-identity.outputs.git_sha }}
+      image_digest: ${{ steps.published-identity.outputs.image_digest }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -76,16 +94,20 @@ jobs:
 
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             TAGS="${IMAGE}:${REF_NAME},${IMAGE}:sha-${SHORT_SHA}"
+            PRIMARY_TAG="$REF_NAME"
             DEPLOY_TARGET="production"
           elif [[ "$GITHUB_REF_NAME" == "main" ]]; then
             TAGS="${IMAGE}:main-latest,${IMAGE}:sha-${SHORT_SHA}"
+            PRIMARY_TAG="main-latest"
             DEPLOY_TARGET="staging"
           else
             TAGS="${IMAGE}:sha-${SHORT_SHA}"
+            PRIMARY_TAG="sha-${SHORT_SHA}"
             DEPLOY_TARGET="preview"
           fi
 
           echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "primary_tag=${PRIMARY_TAG}" >> $GITHUB_OUTPUT
           echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
           echo "deploy_target=${DEPLOY_TARGET}" >> $GITHUB_OUTPUT
           echo "tags<<EOF" >> $GITHUB_OUTPUT
@@ -125,6 +147,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
+        id: build-image
         if: steps.skip.outputs.already_built != 'true'
         uses: docker/build-push-action@v7
         with:
@@ -146,8 +169,7 @@ jobs:
 
       # Tag-only path: SHA ja existe, so adiciona nova tag ao manifest sem
       # rebuildar. Crane faz isso via Registry API (sem download da imagem).
-      - name: Install crane (tag-only fast path)
-        if: steps.skip.outputs.already_built == 'true'
+      - name: Install crane
         uses: imjasonh/setup-crane@v0.4
 
       - name: Tag-only push (image already built)
@@ -160,6 +182,58 @@ jobs:
           crane tag "${{ steps.meta.outputs.image }}:sha-${{ steps.meta.outputs.short_sha }}" "${{ github.ref_name }}"
           echo "::notice::Tagged ${{ github.ref_name }} -> sha-${{ steps.meta.outputs.short_sha }} via crane (no rebuild)"
 
+      - name: Resolve and verify published image identity
+        id: published-identity
+        env:
+          EXPECTED_GIT_SHA: ${{ github.sha }}
+          GH_TOKEN_FOR_REGISTRY: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+          IMAGE_TAG: ${{ steps.meta.outputs.primary_tag }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN_FOR_REGISTRY" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+          IMAGE_DIGEST=$(crane digest "$IMAGE:$IMAGE_TAG")
+          OCI_REVISION=$(crane config "$IMAGE:$IMAGE_TAG" \
+            | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty')
+
+          if [[ ! "$EXPECTED_GIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Expected Git SHA is not a full lowercase SHA-1"
+            exit 1
+          fi
+          if [ "$OCI_REVISION" != "$EXPECTED_GIT_SHA" ]; then
+            echo "::error::Published image OCI revision does not match the triggering commit"
+            exit 1
+          fi
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Published image is missing a valid immutable digest"
+            exit 1
+          fi
+
+          {
+            echo "image=$IMAGE"
+            echo "image_tag=$IMAGE_TAG"
+            echo "git_sha=$EXPECTED_GIT_SHA"
+            echo "image_digest=$IMAGE_DIGEST"
+          } >> "$GITHUB_OUTPUT"
+
+          jq -n \
+            --arg schema_version "1" \
+            --arg image "$IMAGE" \
+            --arg image_tag "$IMAGE_TAG" \
+            --arg git_sha "$EXPECTED_GIT_SHA" \
+            --arg image_digest "$IMAGE_DIGEST" \
+            '{schema_version:$schema_version,image:$image,image_tag:$image_tag,git_sha:$git_sha,image_digest:$image_digest}' \
+            > "$RUNNER_TEMP/release-identity.json"
+
+      - name: Upload immutable release identity
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-identity-${{ github.run_id }}
+          path: ${{ runner.temp }}/release-identity.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Summary
         run: |
           echo "## Image published — ${{ steps.meta.outputs.deploy_target }}" >> $GITHUB_STEP_SUMMARY
@@ -170,3 +244,8 @@ jobs:
           fi
           echo "Tags publicados:" >> $GITHUB_STEP_SUMMARY
           echo '${{ steps.meta.outputs.tags }}' | sed 's/^/- `/' | sed 's/$/`/' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Identidade imutavel:" >> $GITHUB_STEP_SUMMARY
+          echo "- tag: \`${{ steps.published-identity.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- git SHA: \`${{ steps.published-identity.outputs.git_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- digest: \`${{ steps.published-identity.outputs.image_digest }}\`" >> $GITHUB_STEP_SUMMARY
