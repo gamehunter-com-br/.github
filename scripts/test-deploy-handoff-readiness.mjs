@@ -907,9 +907,11 @@ docker() {
     record "MANIFEST_FRESH true"
     if [ "$manifest_workers" != "$WORKER_FIXTURE_COUNT" ]; then return 1; fi
     if [ "$FAIL_PHASE" = canary-counts ]; then
-      printf '%s\\n' '{"schema_version":"1","status":"passed","run_id":"run-fixture-001","counts":{"fetch_stub_calls":1,"vendor_calls":0,"subscriber_events":1,"redis_jobs":1,"postgres_rows":1,"admin_responses":0,"bullmq_matrix_checks":5,"log_signals":3,"log_primary":1,"log_error":1,"log_stdout":1,"sentry_error":1,"sentry_transaction":1,"sentry_span":1,"sentry_breadcrumb":1,"sentry_log":1,"raw_violations":0}}'
+      printf '%s\\n' '{"schema_version":"1","status":"passed","run_id":"run-fixture-001","counts":{"fetch_stub_calls":1,"vendor_calls":0,"subscriber_events":1,"redis_jobs":1,"postgres_rows":1,"admin_responses":0,"bullmq_matrix_checks":5,"log_signals":3,"log_primary":1,"log_error":1,"log_stdout":1,"sentry_error":1,"sentry_transaction":1,"sentry_span":1,"sentry_transaction_rate_limited":0,"sentry_span_rate_limited":0,"sentry_breadcrumb":1,"sentry_log":1,"raw_violations":0}}'
+    elif [ "$FAIL_PHASE" = canary-trace-quota ]; then
+      printf '%s\\n' '{"schema_version":"1","status":"passed","run_id":"run-fixture-001","counts":{"fetch_stub_calls":1,"vendor_calls":0,"subscriber_events":1,"redis_jobs":1,"postgres_rows":1,"admin_responses":1,"bullmq_matrix_checks":5,"log_signals":3,"log_primary":1,"log_error":1,"log_stdout":1,"sentry_error":1,"sentry_transaction":0,"sentry_span":0,"sentry_transaction_rate_limited":1,"sentry_span_rate_limited":1,"sentry_breadcrumb":1,"sentry_log":1,"raw_violations":0}}'
     else
-      printf '%s\\n' '{"schema_version":"1","status":"passed","run_id":"run-fixture-001","counts":{"fetch_stub_calls":1,"vendor_calls":0,"subscriber_events":1,"redis_jobs":1,"postgres_rows":1,"admin_responses":1,"bullmq_matrix_checks":5,"log_signals":3,"log_primary":1,"log_error":1,"log_stdout":1,"sentry_error":1,"sentry_transaction":1,"sentry_span":1,"sentry_breadcrumb":1,"sentry_log":1,"raw_violations":0}}'
+      printf '%s\\n' '{"schema_version":"1","status":"passed","run_id":"run-fixture-001","counts":{"fetch_stub_calls":1,"vendor_calls":0,"subscriber_events":1,"redis_jobs":1,"postgres_rows":1,"admin_responses":1,"bullmq_matrix_checks":5,"log_signals":3,"log_primary":1,"log_error":1,"log_stdout":1,"sentry_error":1,"sentry_transaction":1,"sentry_span":1,"sentry_transaction_rate_limited":0,"sentry_span_rate_limited":0,"sentry_breadcrumb":1,"sentry_log":1,"raw_violations":0}}'
     fi
   fi
 }
@@ -992,6 +994,9 @@ grep -q '^DOCKER exec .*external-request-telemetry:canary.*--approved-spec=F1-51
 test "$(grep -c '^RESUME_QUEUE$' "$LOG_FILE")" = 1
 grep -q '^ASSERT_RUNNING .* false disabled false$' "$LOG_FILE"
 grep -q '^ASSERT_RUNNING .* true tag true$' "$LOG_FILE"
+
+run_case canary-trace-quota protected-on-bounded
+test "$(grep -c '^RESUME_QUEUE$' "$LOG_FILE")" = 1
 
 WORKER_FIXTURE_COUNT=2
 : > "$LOG_FILE"

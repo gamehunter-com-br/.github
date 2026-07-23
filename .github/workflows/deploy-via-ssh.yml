@@ -1233,11 +1233,23 @@ jobs:
               for count_key in \
                 fetch_stub_calls subscriber_events redis_jobs postgres_rows admin_responses \
                 log_primary log_error log_stdout \
-                sentry_error sentry_transaction sentry_span sentry_breadcrumb sentry_log; do
+                sentry_error sentry_breadcrumb sentry_log; do
                 count_value=\$(printf '%s\n' "\$report" \
                   | sed -n "s/.*\"\${count_key}\":\([0-9][0-9]*\).*/\1/p")
                 if [ "\$count_value" != "1" ]; then
                   echo "FAIL: protected telemetry canary positive control \$count_key is not exactly one"
+                  return 1
+                fi
+              done
+              for trace_key in transaction span; do
+                accepted_value=\$(printf '%s\n' "\$report" \
+                  | sed -n "s/.*\"sentry_\${trace_key}\":\([0-9][0-9]*\).*/\1/p")
+                limited_value=\$(printf '%s\n' "\$report" \
+                  | sed -n "s/.*\"sentry_\${trace_key}_rate_limited\":\([0-9][0-9]*\).*/\1/p")
+                if [[ ! "\$accepted_value" =~ ^[01]$ ]] \
+                  || [[ ! "\$limited_value" =~ ^[01]$ ]] \
+                  || [ "\$((accepted_value + limited_value))" -ne 1 ]; then
+                  echo "FAIL: protected telemetry canary trace control \$trace_key is neither accepted nor exactly-once quota-limited"
                   return 1
                 fi
               done
