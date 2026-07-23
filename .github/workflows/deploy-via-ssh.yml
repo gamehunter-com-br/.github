@@ -1158,6 +1158,12 @@ jobs:
               local expected_image_id
               local host_hash
 
+              # BullMQ worker registrations can outlive a graceful container
+              # replacement for one lock interval. Keep the parity check exact,
+              # but let the superseded registration expire before observing it.
+              echo "Waiting for BullMQ worker registry to stabilize"
+              sleep 35
+
               build_runtime_manifest_from_running_containers \
                 || { cleanup_protected_canary_runtime; return 1; }
               CANARY_CONTAINER_MANIFEST_PATH="/tmp/gamehunter-f1-513-runtime-manifest-$DEPLOY_RUN_ID.json"

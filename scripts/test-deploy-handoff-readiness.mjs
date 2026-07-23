@@ -345,6 +345,18 @@ function assertProtectedModeContract() {
   assert.ok(deploy.includes('--confirm-high=run-protected-telemetry-canary'));
   assert.ok(deploy.includes('EXTERNAL_REQUEST_TELEMETRY_RUNTIME_MANIFEST_PATH'));
   assert.ok(deploy.includes('build_runtime_manifest_from_running_containers'));
+  const canaryFunction = deploy.slice(
+    deploy.indexOf('run_protected_telemetry_canary()'),
+    deploy.indexOf('bounded_protected_canary()'),
+  );
+  const registryWait = canaryFunction.indexOf('sleep 35');
+  const runtimeManifest = canaryFunction.indexOf(
+    'build_runtime_manifest_from_running_containers',
+  );
+  assert.ok(
+    registryWait > -1 && runtimeManifest > registryWait,
+    'protected canary must let superseded BullMQ registrations expire before exact parity',
+  );
   assert.ok(deploy.includes('docker cp'));
   assert.ok(deploy.includes('copied runtime manifest is missing or was altered'));
   assert.ok(deploy.includes("date -u +'%Y-%m-%dT%H:%M:%S.%3NZ'"));
