@@ -312,7 +312,7 @@ jobs:
           trap 'rm -f "$keyscan_file"' EXIT
           for attempt in 1 2 3 4 5 6; do
             : > "$keyscan_file"
-            ssh-keyscan -T 10 -H "$VPS_HOST" > "$keyscan_file" 2>/dev/null || true
+            ssh-keyscan -T 10 -t ed25519 -H "$VPS_HOST" > "$keyscan_file" 2>/dev/null || true
             if [ -s "$keyscan_file" ]; then
               cat "$keyscan_file" >> ~/.ssh/known_hosts
               break
@@ -353,7 +353,13 @@ jobs:
           GH_OWNER: ${{ github.repository_owner }}
         run: |
           # Heredoc SEM quote no marker => expansao LOCAL acontece, escapes \$ ficam literal
-          ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" 'bash -euo pipefail -s' << EOF
+          ssh \
+            -o ConnectTimeout=15 \
+            -o ConnectionAttempts=3 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=3 \
+            -i ~/.ssh/deploy_key \
+            "$VPS_USER@$VPS_HOST" 'bash -euo pipefail -s' << EOF
             cd "$VPS_PATH"
 
             # ENV_FILE_HARDENING_START
