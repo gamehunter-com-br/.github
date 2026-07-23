@@ -251,9 +251,15 @@ function assertDeploySshKeyscanIsBoundedAndRetried() {
   assert.ok(sshStart > -1, 'deploy workflow must configure SSH');
   assert.ok(deployStart > sshStart, 'SSH setup must precede the VPS mutation step');
   assert.match(sshBlock, /for attempt in 1 2 3 4 5 6/);
-  assert.match(sshBlock, /ssh-keyscan -T 10 -H "\$VPS_HOST"/);
+  assert.match(sshBlock, /ssh-keyscan -T 10 -t ed25519 -H "\$VPS_HOST"/);
   assert.match(sshBlock, /if \[ -s "\$keyscan_file" \]/);
   assert.match(sshBlock, /if \[ "\$attempt" -eq 6 \]/);
+
+  const remoteStep = workflow.slice(deployStart);
+  assert.match(remoteStep, /-o ConnectTimeout=15/);
+  assert.match(remoteStep, /-o ConnectionAttempts=3/);
+  assert.match(remoteStep, /-o ServerAliveInterval=30/);
+  assert.match(remoteStep, /-o ServerAliveCountMax=3/);
 }
 
 function assertDeployTagInputIsNotInterpolatedIntoShellSource() {
