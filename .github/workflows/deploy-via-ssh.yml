@@ -301,11 +301,28 @@ jobs:
           echo "deploy-workers resolved: $MODE ($REASON)"
 
       - name: Set up SSH
+        env:
+          VPS_HOST: ${{ inputs.vps-host }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H ${{ inputs.vps-host }} >> ~/.ssh/known_hosts 2>/dev/null
+          keyscan_file="$(mktemp)"
+          trap 'rm -f "$keyscan_file"' EXIT
+          for attempt in 1 2 3 4 5 6; do
+            : > "$keyscan_file"
+            ssh-keyscan -T 10 -H "$VPS_HOST" > "$keyscan_file" 2>/dev/null || true
+            if [ -s "$keyscan_file" ]; then
+              cat "$keyscan_file" >> ~/.ssh/known_hosts
+              break
+            fi
+            if [ "$attempt" -eq 6 ]; then
+              echo "::error::Nao foi possivel obter a chave SSH do VPS apos 6 tentativas"
+              exit 1
+            fi
+            sleep 5
+          done
 
       - name: Pull image and restart on VPS
         env:
