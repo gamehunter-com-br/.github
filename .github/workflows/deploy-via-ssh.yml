@@ -1287,6 +1287,13 @@ jobs:
               deadline=\$((SECONDS + $PROTECTED_BOUNDED_SECONDS))
               while [ "\$SECONDS" -lt "\$deadline" ]; do
                 remaining=\$((deadline - SECONDS))
+                # Do not start another multi-endpoint matrix when only the
+                # final sleep budget remains. The previous complete matrix is
+                # still valid and the bounded window remains exactly sized.
+                if [ "\$remaining" -le 4 ]; then
+                  sleep "\$remaining"
+                  break
+                fi
                 max_time=8
                 if [ "\$remaining" -lt "\$max_time" ]; then max_time="\$remaining"; fi
                 curl -fsS --connect-timeout 2 --max-time "\$max_time" \
