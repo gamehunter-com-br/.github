@@ -242,7 +242,7 @@ function assertRollbackTagIsValidatedBeforeSsh() {
   }
 }
 
-function assertDeploySshKeyscanIsBoundedAndRetried() {
+function assertDeployUsesOneHardenedSshSession() {
   const workflow = readFileSync(deployWorkflowPath, 'utf8');
   const sshStart = workflow.indexOf('- name: Set up SSH');
   const deployStart = workflow.indexOf('- name: Pull image and restart on VPS');
@@ -250,12 +250,11 @@ function assertDeploySshKeyscanIsBoundedAndRetried() {
 
   assert.ok(sshStart > -1, 'deploy workflow must configure SSH');
   assert.ok(deployStart > sshStart, 'SSH setup must precede the VPS mutation step');
-  assert.match(sshBlock, /for attempt in 1 2 3 4 5 6/);
-  assert.match(sshBlock, /ssh-keyscan -T 10 -t ed25519 -H "\$VPS_HOST"/);
-  assert.match(sshBlock, /if \[ -s "\$keyscan_file" \]/);
-  assert.match(sshBlock, /if \[ "\$attempt" -eq 6 \]/);
+  assert.doesNotMatch(sshBlock, /ssh-keyscan/);
 
   const remoteStep = workflow.slice(deployStart);
+  assert.match(remoteStep, /-o StrictHostKeyChecking=accept-new/);
+  assert.match(remoteStep, /-o UserKnownHostsFile=~\/\.ssh\/known_hosts/);
   assert.match(remoteStep, /-o ConnectTimeout=15/);
   assert.match(remoteStep, /-o ConnectionAttempts=3/);
   assert.match(remoteStep, /-o ServerAliveInterval=30/);
@@ -1125,7 +1124,7 @@ assert.equal(rollback.afterRollback.servedBy, 'canonical-rollback');
 
 assertWorkflowKeepsGuardBeforeRecreate();
 assertRollbackTagIsValidatedBeforeSsh();
-assertDeploySshKeyscanIsBoundedAndRetried();
+assertDeployUsesOneHardenedSshSession();
 assertDeployTagInputIsNotInterpolatedIntoShellSource();
 assertReleaseIdentityContract();
 assertBuildOnlyIdentityContract();
