@@ -38,6 +38,7 @@ jobs:
           # Shell semantics are covered by the dedicated fixture below. Keep this
           # gate deterministic across runner images by disabling optional tools.
           "$RUNNER_TEMP/actionlint" -no-color -shellcheck="" -pyflakes="" \
+            .github/workflows/build-push-image.yml \
             .github/workflows/deploy-via-ssh.yml \
             .github/workflows/rollback-via-ssh.yml \
             .github/workflows/validate-reusable-workflows.yml

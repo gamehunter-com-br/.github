@@ -42,6 +42,26 @@ on:
         required: false
         default: ''
         type: string
+      release-identity-enabled:
+        description: 'Persiste tag, git SHA e digest verificados no .env do runtime'
+        required: false
+        default: false
+        type: boolean
+      rollback-mode:
+        description: 'standard ou protected-same-image-off'
+        required: false
+        default: standard
+        type: string
+      expected-git-sha:
+        description: 'SHA completo esperado; obrigatorio no rollback protegido'
+        required: false
+        default: ''
+        type: string
+      expected-image-digest:
+        description: 'Digest sha256 esperado; obrigatorio no rollback protegido'
+        required: false
+        default: ''
+        type: string
       runner:
         description: 'GitHub Actions runner'
         required: false
@@ -67,18 +87,66 @@ jobs:
     runs-on: ${{ inputs.runner }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Validate rollback image tag
         id: rollback-tag
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag }}
+          ROLLBACK_MODE: ${{ inputs.rollback-mode }}
+          EXPECTED_GIT_SHA_INPUT: ${{ inputs.expected-git-sha }}
+          EXPECTED_IMAGE_DIGEST_INPUT: ${{ inputs.expected-image-digest }}
+          RELEASE_IDENTITY_ENABLED: ${{ inputs.release-identity-enabled }}
         run: |
           set -euo pipefail
           if [[ ! "$TAG" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|sha-[0-9a-f]{7})$ ]]; then
             echo "::error::Rollback tag must match vX.Y.Z or sha-XXXXXXX"
             exit 1
           fi
+          case "$ROLLBACK_MODE" in
+            standard|protected-same-image-off) ;;
+            *)
+              echo "::error::rollback-mode invalido: $ROLLBACK_MODE"
+              exit 1
+              ;;
+          esac
+          if [[ "$TAG" == v* ]]; then
+            git fetch --tags --force origin '+refs/tags/*:refs/tags/*' >/dev/null
+            RESOLVED_GIT_SHA=$(git rev-parse "$TAG^{commit}")
+          else
+            RESOLVED_GIT_SHA=$(gh api "/repos/${GITHUB_REPOSITORY}/commits/${TAG#sha-}" --jq '.sha')
+            if [ "${RESOLVED_GIT_SHA:0:7}" != "${TAG#sha-}" ]; then
+              echo "::error::sha tag nao corresponde ao commit resolvido"
+              exit 1
+            fi
+          fi
+          RESOLVED_GIT_SHA="${RESOLVED_GIT_SHA,,}"
+          if [[ ! "$RESOLVED_GIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Nao foi possivel resolver a tag para SHA completo"
+            exit 1
+          fi
+          if [ -n "$EXPECTED_GIT_SHA_INPUT" ] && [ "$EXPECTED_GIT_SHA_INPUT" != "$RESOLVED_GIT_SHA" ]; then
+            echo "::error::expected-git-sha nao corresponde a tag solicitada"
+            exit 1
+          fi
+          if [ -n "$EXPECTED_IMAGE_DIGEST_INPUT" ] \
+            && [[ ! "$EXPECTED_IMAGE_DIGEST_INPUT" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::expected-image-digest invalido"
+            exit 1
+          fi
+          if [ "$ROLLBACK_MODE" = "protected-same-image-off" ]; then
+            if [ "$RELEASE_IDENTITY_ENABLED" != "true" ] \
+              || [ -z "$EXPECTED_GIT_SHA_INPUT" ] \
+              || [ -z "$EXPECTED_IMAGE_DIGEST_INPUT" ]; then
+              echo "::error::rollback protegido exige identidade completa habilitada"
+              exit 1
+            fi
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "git_sha=$RESOLVED_GIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "image_digest=$EXPECTED_IMAGE_DIGEST_INPUT" >> "$GITHUB_OUTPUT"
 
       - name: Set up SSH
         run: |
@@ -98,6 +166,11 @@ jobs:
           HEALTH_PATH: ${{ inputs.health-path }}
           DEFAULT_PORT: ${{ inputs.default-port }}
           EXTRA_SERVICES: ${{ inputs.extra-services }}
+          RELEASE_IDENTITY_ENABLED: ${{ inputs.release-identity-enabled }}
+          ROLLBACK_MODE: ${{ inputs.rollback-mode }}
+          EXPECTED_GIT_SHA: ${{ steps.rollback-tag.outputs.git_sha }}
+          EXPECTED_IMAGE_DIGEST: ${{ steps.rollback-tag.outputs.image_digest }}
+          DEPLOY_RUN_ID: ${{ github.run_id }}
           GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
           GH_OWNER: ${{ github.repository_owner }}
         run: |
@@ -153,8 +226,47 @@ jobs:
 
             update_image_tag_env() {
               local image_tag="\$1"
+              local release_tag="\${2:-}"
+              local git_sha="\${3:-}"
+              local image_digest="\${4:-}"
+              local external_request_log="\${5:-}"
+              local fetch_proxy_mode="\${6:-}"
+              local sentry_egress="\${7:-}"
+              local identity_enabled=false
+              local capture_policy_enabled=false
               local grep_status=0
               local mode
+
+              if [ "\$#" -eq 7 ]; then
+                identity_enabled=true
+                capture_policy_enabled=true
+                if [[ ! "\$external_request_log" =~ ^(true|false)$ ]] \
+                  || [[ ! "\$sentry_egress" =~ ^(true|false)$ ]] \
+                  || [[ ! "\$fetch_proxy_mode" =~ ^(disabled|tag)$ ]]; then
+                  echo "FAIL: invalid protected capture policy"
+                  return 1
+                fi
+              elif [ "\$#" -eq 4 ]; then
+                identity_enabled=true
+              elif [ "\$#" -ne 1 ]; then
+                echo "FAIL: release identity must be complete or omitted"
+                return 1
+              fi
+
+              if [ "\$identity_enabled" = "true" ]; then
+                if [[ ! "\$release_tag" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|sha-[0-9a-f]{7})$ ]]; then
+                  echo "FAIL: invalid release identity tag"
+                  return 1
+                fi
+                if [[ ! "\$git_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "FAIL: invalid release identity git SHA"
+                  return 1
+                fi
+                if [[ ! "\$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                  echo "FAIL: invalid release identity image digest"
+                  return 1
+                fi
+              fi
 
               cleanup_env_tmp
               if ! cleanup_legacy_env_new; then
@@ -169,7 +281,11 @@ jobs:
                 ENV_TMP=""
                 return 1
               fi
-              grep -v '^IMAGE_TAG=' .env > "\$ENV_TMP" || grep_status=\$?
+              if [ "\$capture_policy_enabled" = "true" ]; then
+                grep -Ev '^(IMAGE_TAG|GH_RELEASE_TAG|GH_GIT_SHA|GH_IMAGE_DIGEST|EXTERNAL_REQUEST_LOG_ENABLED|FETCH_PROXY_MODE|SENTRY_EGRESS_ENABLED)=' .env > "\$ENV_TMP" || grep_status=\$?
+              else
+                grep -Ev '^(IMAGE_TAG|GH_RELEASE_TAG|GH_GIT_SHA|GH_IMAGE_DIGEST)=' .env > "\$ENV_TMP" || grep_status=\$?
+              fi
               if [ "\$grep_status" -gt 1 ]; then
                 cleanup_env_tmp
                 return "\$grep_status"
@@ -177,6 +293,18 @@ jobs:
 
               if ! printf 'IMAGE_TAG=%s\n' "\$image_tag" >> "\$ENV_TMP"; then
                 return 1
+              fi
+              if [ "\$identity_enabled" = "true" ]; then
+                if ! printf 'GH_RELEASE_TAG=%s\nGH_GIT_SHA=%s\nGH_IMAGE_DIGEST=%s\n' \
+                  "\$release_tag" "\$git_sha" "\$image_digest" >> "\$ENV_TMP"; then
+                  return 1
+                fi
+              fi
+              if [ "\$capture_policy_enabled" = "true" ]; then
+                if ! printf 'EXTERNAL_REQUEST_LOG_ENABLED=%s\nFETCH_PROXY_MODE=%s\nSENTRY_EGRESS_ENABLED=%s\n' \
+                  "\$external_request_log" "\$fetch_proxy_mode" "\$sentry_egress" >> "\$ENV_TMP"; then
+                  return 1
+                fi
               fi
               if ! chmod 600 "\$ENV_TMP"; then
                 return 1
@@ -196,23 +324,309 @@ jobs:
                 return 1
               fi
             }
+
+            resolve_release_identity() {
+              local image_ref="\$1"
+              local release_tag="\$2"
+              local expected_git_sha="\${3:-}"
+              local expected_image_digest="\${4:-}"
+              local git_sha
+              local image_repository
+              local candidate_digest
+              local match_count=0
+              local repo_digest
+              local image_digest
+
+              git_sha=\$(docker image inspect \
+                --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+                "\$image_ref")
+              image_repository="\${image_ref%:*}"
+              repo_digest=""
+              while IFS= read -r candidate_digest; do
+                case "\$candidate_digest" in
+                  "\$image_repository"@*)
+                    repo_digest="\$candidate_digest"
+                    match_count=\$((match_count + 1))
+                    ;;
+                esac
+              done < <(docker image inspect \
+                --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+                "\$image_ref")
+              if [ "\$match_count" -ne 1 ]; then
+                echo "FAIL: expected exactly one target repository digest; found \$match_count"
+                return 1
+              fi
+              image_digest="\${repo_digest##*@}"
+
+              if [[ ! "\$release_tag" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|sha-[0-9a-f]{7})$ ]]; then
+                echo "FAIL: invalid release identity tag"
+                return 1
+              fi
+              git_sha="\${git_sha,,}"
+              if [[ ! "\$git_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "FAIL: image is missing a full OCI revision label"
+                return 1
+              fi
+              if [[ "\$release_tag" == sha-* ]] \
+                && [ "\${git_sha:0:7}" != "\${release_tag#sha-}" ]; then
+                echo "FAIL: image OCI revision does not match sha tag"
+                return 1
+              fi
+              if [[ ! "\$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "FAIL: pulled image is missing a valid repository digest"
+                return 1
+              fi
+              if [ -n "\$expected_git_sha" ] && [ "\$git_sha" != "\$expected_git_sha" ]; then
+                echo "FAIL: pulled image OCI revision does not match expected Git SHA"
+                return 1
+              fi
+              if [ -n "\$expected_image_digest" ] \
+                && [ "\$image_digest" != "\$expected_image_digest" ]; then
+                echo "FAIL: pulled image digest does not match expected digest"
+                return 1
+              fi
+
+              GH_RELEASE_TAG="\$release_tag"
+              GH_GIT_SHA="\$git_sha"
+              GH_IMAGE_DIGEST="\$image_digest"
+              export GH_RELEASE_TAG GH_GIT_SHA GH_IMAGE_DIGEST
+            }
             # ENV_FILE_HARDENING_END
+
+            read_single_env_value() {
+              local key="\$1"
+              local count
+              count=\$(grep -c "^\${key}=" .env || true)
+              if [ "\$count" -ne 1 ]; then
+                echo "FAIL: expected exactly one \$key in .env"
+                return 1
+              fi
+              sed -n "s/^\${key}=//p" .env
+            }
+
+            assert_persisted_release_identity() {
+              local capture_enabled fetch_proxy_mode persisted_digest persisted_image_tag
+              local persisted_sha persisted_tag sentry_enabled
+              if [ ! -f .env ] || [ -L .env ]; then
+                echo "FAIL: .env must be a regular non-symlink file"
+                return 1
+              fi
+              persisted_image_tag=\$(read_single_env_value IMAGE_TAG) || return 1
+              persisted_tag=\$(read_single_env_value GH_RELEASE_TAG) || return 1
+              persisted_sha=\$(read_single_env_value GH_GIT_SHA) || return 1
+              persisted_digest=\$(read_single_env_value GH_IMAGE_DIGEST) || return 1
+              capture_enabled=\$(read_single_env_value EXTERNAL_REQUEST_LOG_ENABLED) || return 1
+              fetch_proxy_mode=\$(read_single_env_value FETCH_PROXY_MODE) || return 1
+              sentry_enabled=\$(read_single_env_value SENTRY_EGRESS_ENABLED) || return 1
+              if [ "\$persisted_image_tag" != "$TAG" ] \
+                || [ "\$persisted_tag" != "$TAG" ] \
+                || [ "\$persisted_sha" != "$EXPECTED_GIT_SHA" ] \
+                || [ "\$persisted_digest" != "$EXPECTED_IMAGE_DIGEST" ]; then
+                echo "FAIL: protected rollback rejects a different tag, SHA or image digest"
+                return 1
+              fi
+              if ! { [ "\$capture_enabled" = "false" ] \
+                && [ "\$fetch_proxy_mode" = "disabled" ] \
+                && [ "\$sentry_enabled" = "false" ]; } \
+                && ! { [ "\$capture_enabled" = "true" ] \
+                  && [ "\$fetch_proxy_mode" = "tag" ] \
+                  && [ "\$sentry_enabled" = "true" ]; }; then
+                echo "FAIL: protected rollback rejects a mixed capture policy"
+                return 1
+              fi
+              PERSISTED_EXTERNAL_REQUEST_LOG="\$capture_enabled"
+              PERSISTED_FETCH_PROXY_MODE="\$fetch_proxy_mode"
+              PERSISTED_SENTRY_EGRESS="\$sentry_enabled"
+            }
+
+            assert_running_release_identity() {
+              local image_ref="\$1"
+              local expected_git_sha="\$2"
+              local expected_image_digest="\$3"
+              local expected_external_request_log="\${4:-}"
+              local expected_fetch_proxy_mode="\${5:-}"
+              local expected_sentry_egress="\${6:-}"
+              local expected_image_id running_service container_ids container_id running_image_id
+              local effective_env env_key env_key_count env_match_count expected_env
+              local running_state running_revision target_repository candidate_digest digest_matches
+              expected_image_id=\$(docker image inspect --format '{{.Id}}' "\$image_ref") || return 1
+              target_repository="\${image_ref%:*}"
+              for running_service in \$ALL_SERVICES; do
+                container_ids=\$(docker compose ps -q "\$running_service") || return 1
+                [ -n "\$container_ids" ] || {
+                  echo "FAIL: service \$running_service has no running container"
+                  return 1
+                }
+                for container_id in \$container_ids; do
+                  running_state=\$(docker inspect --format '{{.State.Running}}' "\$container_id") || return 1
+                  running_image_id=\$(docker inspect --format '{{.Image}}' "\$container_id") || return 1
+                  if [ "\$running_state" != "true" ] || [ "\$running_image_id" != "\$expected_image_id" ]; then
+                    echo "FAIL: service \$running_service is not running the expected image ID"
+                    return 1
+                  fi
+                  running_revision=\$(docker image inspect \
+                    --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+                    "\$running_image_id") || return 1
+                  [ "\${running_revision,,}" = "\$expected_git_sha" ] || {
+                    echo "FAIL: service \$running_service OCI revision mismatch"
+                    return 1
+                  }
+                  digest_matches=0
+                  while IFS= read -r candidate_digest; do
+                    if [ "\$candidate_digest" = "\$target_repository@\$expected_image_digest" ]; then
+                      digest_matches=\$((digest_matches + 1))
+                    fi
+                  done < <(docker image inspect \
+                    --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+                    "\$running_image_id")
+                  [ "\$digest_matches" -eq 1 ] || {
+                    echo "FAIL: service \$running_service digest mismatch"
+                    return 1
+                  }
+                  if [ -n "\$expected_external_request_log" ]; then
+                    effective_env=\$(docker inspect \
+                      --format '{{range .Config.Env}}{{println .}}{{end}}' \
+                      "\$container_id") || return 1
+                    for expected_env in \
+                      "EXTERNAL_REQUEST_LOG_ENABLED=\$expected_external_request_log" \
+                      "FETCH_PROXY_MODE=\$expected_fetch_proxy_mode" \
+                      "SENTRY_EGRESS_ENABLED=\$expected_sentry_egress"; do
+                      env_key="\${expected_env%%=*}"
+                      env_key_count=\$(printf '%s\n' "\$effective_env" \
+                        | grep -c "^\${env_key}=" || true)
+                      env_match_count=\$(printf '%s\n' "\$effective_env" \
+                        | grep -Fxc "\$expected_env" || true)
+                      if [ "\$env_key_count" -ne 1 ] || [ "\$env_match_count" -ne 1 ]; then
+                        echo "FAIL: service \$running_service effective protected policy mismatch for \$env_key"
+                        return 1
+                      fi
+                    done
+                  fi
+                done
+              done
+            }
+
+            recover_active_drain_id() {
+              local active_drain_json deploy_ref queue_json recovered_id
+              local recovered_image_tag recovered_status snapshot status_output
+              status_output=\$(docker compose run -T --rm --no-deps "$SERVICE" \
+                npm run deploy:workers:status -- --json < /dev/null) || return 1
+              snapshot=\$(printf '%s\n' "\$status_output" | grep '^{' | tail -n 1)
+              queue_json=\$(printf '%s\n' "\$snapshot" \
+                | sed -n 's/^{"queue"://; s/,"active_drain".*//; p')
+              active_drain_json=\$(printf '%s\n' "\$snapshot" \
+                | sed -n 's/.*"active_drain"://; s/,"active_jobs".*//; p')
+              recovered_id=\$(printf '%s\n' "\$active_drain_json" \
+                | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+              deploy_ref=\$(printf '%s\n' "\$active_drain_json" \
+                | sed -n 's/.*"deploy_ref":"\([^"]*\)".*/\1/p')
+              recovered_image_tag=\$(printf '%s\n' "\$active_drain_json" \
+                | sed -n 's/.*"image_tag":"\([^"]*\)".*/\1/p')
+              recovered_status=\$(printf '%s\n' "\$active_drain_json" \
+                | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
+              [[ "\$recovered_id" =~ ^[A-Za-z0-9._:-]{8,128}$ ]] || return 1
+              [[ "\$deploy_ref" =~ ^[A-Za-z0-9._:-]{1,128}$ ]] || return 1
+              [ "\$recovered_image_tag" = "$TAG" ] || return 1
+              [ "\$recovered_status" = "ready" ] || return 1
+              case "\$queue_json" in
+                *'"paused":true'*'"pause_reason":"deploy_drain"'*) ;;
+                *) return 1 ;;
+              esac
+              WORKER_DRAIN_ID="\$recovered_id"
+            }
+
+            ensure_worker_queue_paused() {
+              local created_drain_id drain_output
+              if recover_active_drain_id; then
+                return 0
+              fi
+              drain_output=\$(docker compose run -T --rm --no-deps "$SERVICE" npm run deploy:workers:drain -- \
+                --deploy-ref "$DEPLOY_RUN_ID" \
+                --image-tag "$TAG" \
+                --timeout-ms 900000 \
+                --source github_actions \
+                --json < /dev/null) || return 1
+              WORKER_DRAIN_ID=\$(printf '%s\n' "\$drain_output" | tail -n 1 \
+                | sed -n 's/.*"drain_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+              [[ "\$WORKER_DRAIN_ID" =~ ^[A-Za-z0-9._:-]{8,128}$ ]] || return 1
+              created_drain_id="\$WORKER_DRAIN_ID"
+              recover_active_drain_id || return 1
+              [ "\$WORKER_DRAIN_ID" = "\$created_drain_id" ]
+            }
+
+            force_same_image_capture_off() {
+              export IMAGE_TAG="$TAG"
+              docker compose stop \$ALL_SERVICES || return 1
+              update_image_tag_env \
+                "\$IMAGE_TAG" "$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
+                false disabled false || return 1
+              docker compose up -d --no-build --force-recreate \$ALL_SERVICES || return 1
+              assert_running_release_identity \
+                "${IMAGE}:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
+                false disabled false || return 1
+            }
 
             trap 'status=\$?; cleanup_env_tmp; exit \$status' EXIT
 
             echo "$GHCR_PULL_TOKEN" | docker login ghcr.io -u "$GH_OWNER" --password-stdin
 
             export IMAGE_TAG="$TAG"
-            update_image_tag_env "\$IMAGE_TAG"
-
             ALL_SERVICES="$SERVICE $EXTRA_SERVICES"
+            if [ "$ROLLBACK_MODE" = "protected-same-image-off" ]; then
+              NORMALIZED_SERVICES=\$(printf '%s\n' "\$ALL_SERVICES" | xargs)
+              if [ "$SERVICE" != "backend" ] \
+                || [ "\$NORMALIZED_SERVICES" != "backend workers" ]; then
+                echo "FAIL: protected rollback requires backend + workers"
+                exit 1
+              fi
+              assert_persisted_release_identity
+              docker pull "${IMAGE}:$TAG"
+              resolve_release_identity \
+                "${IMAGE}:$TAG" "$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST"
+              assert_running_release_identity \
+                "${IMAGE}:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
+                "\$PERSISTED_EXTERNAL_REQUEST_LOG" "\$PERSISTED_FETCH_PROXY_MODE" \
+                "\$PERSISTED_SENTRY_EGRESS"
+              ensure_worker_queue_paused
+              if ! force_same_image_capture_off; then
+                echo "FAIL: protected rollback failed; retrying same-image capture-off containment"
+                ensure_worker_queue_paused || true
+                force_same_image_capture_off || true
+                docker logout ghcr.io || true
+                exit 1
+              fi
+
+              PORT=\$(grep "^PORT=" .env | cut -d= -f2 | head -1)
+              PORT=\${PORT:-$DEFAULT_PORT}
+              for i in \$(seq 1 30); do
+                if curl -fsS --connect-timeout 2 --max-time 8 \
+                  "http://localhost:\$PORT$HEALTH_PATH" > /dev/null 2>&1; then
+                  echo "OK Protected same-image capture-off rollback to $TAG; queue remains paused"
+                  docker logout ghcr.io
+                  exit 0
+                fi
+                sleep 2
+              done
+              echo "FAIL Protected rollback health; same image remains capture-off and queue paused"
+              docker logout ghcr.io || true
+              exit 1
+            fi
+
             docker compose pull \$ALL_SERVICES
+            if [ "$RELEASE_IDENTITY_ENABLED" = "true" ]; then
+              resolve_release_identity \
+                "${IMAGE}:$TAG" "$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST"
+              update_image_tag_env "\$IMAGE_TAG" "\$GH_RELEASE_TAG" "\$GH_GIT_SHA" "\$GH_IMAGE_DIGEST"
+            else
+              update_image_tag_env "\$IMAGE_TAG"
+            fi
             docker compose up -d --no-build \$ALL_SERVICES
 
             PORT=\$(grep "^PORT=" .env | cut -d= -f2 | head -1)
             PORT=\${PORT:-$DEFAULT_PORT}
             for i in \$(seq 1 30); do
-              if curl -fsS "http://localhost:\$PORT$HEALTH_PATH" > /dev/null 2>&1; then
+              if curl -fsS --connect-timeout 2 --max-time 8 \
+                "http://localhost:\$PORT$HEALTH_PATH" > /dev/null 2>&1; then
                 echo "OK Rollback to $TAG"
                 docker logout ghcr.io
                 exit 0
