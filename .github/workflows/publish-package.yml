@@ -7,6 +7,16 @@ name: Publish Package (reusable)
 #
 # Design (gamehunter-design) usa workflow proprio (Changesets + Turbo
 # + monorepo) — nao migrado pra este reusable.
+#
+# A TAG E A FONTE UNICA DE VERDADE DA VERSAO.
+# `promote-release.yml` calcula a proxima tag a partir da linhagem de tags
+# git e NAO commita o bump no package.json. Ate 2026-08, este workflow lia
+# a versao do package.json: quando as duas divergiam, ele encontrava a versao
+# antiga ja publicada, emitia "already exists; skipping" e terminava VERDE
+# sem publicar nada — a tag existia, o release "passava", e o consumidor
+# quebrava com ETARGET. Agora a versao vem de `${GITHUB_REF_NAME#v}` e o
+# package.json e alinhado a ela antes do build; divergencia que resultaria
+# em no-op e FALHA explicita, nunca skip silencioso.
 
 on:
   workflow_call:
@@ -75,25 +85,79 @@ jobs:
           scope: '@gamehunter-com-br'
           cache: npm
 
-      - name: Read package metadata
-        id: package
+      - name: Resolve release version
+        id: release
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          node -e "const p=require('./package.json'); if(!p.name||!p.version) throw new Error('package.json must define name and version'); console.log('name='+p.name); console.log('version='+p.version)" >> "$GITHUB_OUTPUT"
+          NAME="$(node -p "require('./package.json').name || ''")"
+          PKG_VERSION="$(node -p "require('./package.json').version || ''")"
+          if [ -z "$NAME" ] || [ -z "$PKG_VERSION" ]; then
+            echo "::error::package.json must define name and version"
+            exit 1
+          fi
+
+          # A tag manda. package.json e apenas o estado do repo, que
+          # `promote-release.yml` nao atualiza ao criar a tag.
+          if [ "$REF_TYPE" = "tag" ]; then
+            if ! printf '%s' "$REF_NAME" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::Release tag '${REF_NAME}' is not a strict vX.Y.Z tag. This workflow derives the published version from the tag; refusing to guess. Delete the tag and promote a semver release tag instead."
+              exit 1
+            fi
+            TARGET="${REF_NAME#v}"
+          else
+            # Invocacao fora de tag push (ex.: workflow_dispatch de teste):
+            # sem tag pra mandar, cai no package.json.
+            TARGET="$PKG_VERSION"
+            echo "::notice::Not a tag ref (${REF_TYPE}); falling back to package.json version ${PKG_VERSION}."
+          fi
+
+          if [ "$TARGET" = "$PKG_VERSION" ]; then
+            DRIFT=false
+          else
+            DRIFT=true
+            echo "::warning::package.json is at ${PKG_VERSION} but release tag asks for ${TARGET}. Publishing ${TARGET} (tag wins); the bump was never committed to main."
+          fi
+
+          {
+            echo "name=${NAME}"
+            echo "version=${TARGET}"
+            echo "package_version=${PKG_VERSION}"
+            echo "drift=${DRIFT}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Check package version availability
         id: publish-check
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PKG: ${{ steps.release.outputs.name }}
+          TARGET: ${{ steps.release.outputs.version }}
+          PKG_VERSION: ${{ steps.release.outputs.package_version }}
+          DRIFT: ${{ steps.release.outputs.drift }}
         run: |
           set -euo pipefail
-          PKG="${{ steps.package.outputs.name }}"
-          VERSION="${{ steps.package.outputs.version }}"
-          if npm view "${PKG}@${VERSION}" version --registry=https://npm.pkg.github.com >/dev/null 2>&1; then
-            echo "already_published=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::${PKG}@${VERSION} already exists in GitHub Packages; skipping build and publish."
+          if npm view "${PKG}@${TARGET}" version --registry=https://npm.pkg.github.com >/dev/null 2>&1; then
+            PUBLISHED=true
           else
-            echo "already_published=false" >> "$GITHUB_OUTPUT"
+            PUBLISHED=false
+          fi
+
+          # O defeito real nao era o skip — era o skip SILENCIOSO. Se a versao
+          # que a tag pede ja existe E o package.json aponta pra outra, este job
+          # nao publicaria nada e ainda assim terminaria verde, deixando a tag
+          # fantasma. Falha alto.
+          if [ "$PUBLISHED" = "true" ] && [ "$DRIFT" = "true" ]; then
+            echo "::error::Version drift with nothing to publish: release tag asks for ${PKG}@${TARGET}, which already exists in GitHub Packages, while package.json is at ${PKG_VERSION}. This release would be a no-op and leave a phantom tag. Promote a tag above the highest published version, or commit the ${TARGET} bump to main."
+            exit 1
+          fi
+
+          echo "already_published=${PUBLISHED}" >> "$GITHUB_OUTPUT"
+          if [ "$PUBLISHED" = "true" ]; then
+            # package.json == tag == versao publicada: re-run legitimo de um
+            # release ja concluido. Idempotente, segue verde.
+            echo "::notice::${PKG}@${TARGET} already exists in GitHub Packages and matches package.json; treating as a re-run of an already published release."
           fi
 
       - name: Install deps (cross-repo)
@@ -106,9 +170,29 @@ jobs:
         if: ${{ !inputs.needs-cross-repo-deps && steps.publish-check.outputs.already_published != 'true' }}
         run: npm ci
 
+      # Depois do `npm ci` (que exige package.json e lockfile em sincronia) e
+      # antes do build, pra que o artefato publicado carregue a versao da tag.
+      - name: Align package.json to release tag
+        if: ${{ steps.release.outputs.drift == 'true' && steps.publish-check.outputs.already_published != 'true' }}
+        env:
+          TARGET: ${{ steps.release.outputs.version }}
+        run: npm version --no-git-tag-version --allow-same-version "$TARGET"
+
       - name: Build
         if: steps.publish-check.outputs.already_published != 'true'
         run: ${{ inputs.build-command }}
+
+      - name: Verify version to publish
+        if: steps.publish-check.outputs.already_published != 'true'
+        env:
+          TARGET: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          ACTUAL="$(node -p "require('./package.json').version")"
+          if [ "$ACTUAL" != "$TARGET" ]; then
+            echo "::error::package.json is at ${ACTUAL} after build but the release tag asks for ${TARGET}. Refusing to publish a version the tag does not name."
+            exit 1
+          fi
 
       - name: Publish
         if: steps.publish-check.outputs.already_published != 'true'
@@ -116,9 +200,29 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Sem `if:` — roda so em success(). Num job que falhou no guard de drift
+      # nao existe "publicado" nem "pulado" pra resumir, e a anotacao ::error::
+      # ja e o sinal.
       - name: Summary
-        if: steps.publish-check.outputs.already_published == 'true'
+        env:
+          PKG: ${{ steps.release.outputs.name }}
+          TARGET: ${{ steps.release.outputs.version }}
+          PKG_VERSION: ${{ steps.release.outputs.package_version }}
+          DRIFT: ${{ steps.release.outputs.drift }}
+          SKIPPED: ${{ steps.publish-check.outputs.already_published }}
         run: |
-          echo "## Publish skipped" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`${{ steps.package.outputs.name }}@${{ steps.package.outputs.version }}\` already exists in GitHub Packages." >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          if [ "$SKIPPED" = "true" ]; then
+            echo "## Publish skipped (already published)" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`${PKG}@${TARGET}\` already exists in GitHub Packages and matches \`package.json\`." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Published" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Package: \`${PKG}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Version published (from tag): \`${TARGET}\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$DRIFT" = "true" ]; then
+            echo "- Version drift: \`package.json\` was at \`${PKG_VERSION}\`; the tag won." >> "$GITHUB_STEP_SUMMARY"
+            echo "- Commit the bump to \`main\` to keep the repo readable; the published artifact is correct either way." >> "$GITHUB_STEP_SUMMARY"
+          fi
