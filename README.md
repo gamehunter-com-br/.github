@@ -49,13 +49,34 @@ jobs:
       RELEASE_TAG_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
 ```
 
-> ⚠️ **Note:** This reusable creates the tag but does NOT bump `package.json`
-> version. Bump it manually on a PR before triggering promote-release, or
-> the next `npm publish` will fail with E409 conflict.
+> ⚠️ **Note:** este reusable cria a tag mas **não** commita o bump do
+> `package.json`. Desde `v1.4.9` isso não quebra mais o publish: o
+> `publish-package.yml` deriva a versão da tag, não do `package.json`.
+> Commitar o bump continua sendo boa higiene (deixa o repo legível), mas
+> deixou de ser pré-requisito.
+>
+> A versão anterior desta nota dizia que sem o bump manual o `npm publish`
+> falharia com **E409**. Estava errado, e o erro custou caro: o publish achava
+> a versão antiga já publicada, emitia `already exists; skipping` e terminava
+> **VERDE sem publicar nada**. Como a doc prometia falha barulhenta, ninguém
+> procurou a silenciosa — foram 57 tags fantasma (33 em `scrapers`, 21 em
+> `contracts`, 3 em `integrations`) até 06/08/2026.
 
 ### `.github/workflows/publish-package.yml`
 
 Publica package npm no GitHub Packages quando tag `vX.Y.Z` é pushada.
+
+**A tag é a fonte única de verdade da versão** (desde `v1.4.9`):
+
+- A versão publicada vem de `${GITHUB_REF_NAME#v}`. Uma tag que não seja
+  `vX.Y.Z` estrito falha em vez de adivinhar.
+- Se o `package.json` divergir, `npm version --no-git-tag-version` o alinha à
+  tag depois do `npm ci` e antes do build, pro artefato publicado carregar a
+  versão que a tag nomeia.
+- Se a versão pedida pela tag **já existe** no registry e o `package.json`
+  aponta pra outra, o job **falha**: ele não publicaria nada e ficaria verde,
+  deixando tag fantasma. Re-run de release já publicado (tag ==
+  `package.json` == publicada) segue idempotente e verde.
 
 **Inputs:**
 - `node-version` (string, default `'22'`)
