@@ -37,10 +37,13 @@ jobs:
         run: |
           # Shell semantics are covered by the dedicated fixture below. Keep this
           # gate deterministic across runner images by disabling optional tools.
+          #
+          # Glob instead of an explicit list: the list had drifted and covered only
+          # 4 of the 7 workflows here. The three that were missing included
+          # ci-pipeline.yml — the single file that governs CI for all four apps —
+          # so an expression typo in the most load-bearing workflow of the org was
+          # not being caught. A glob cannot drift when a workflow is added.
           "$RUNNER_TEMP/actionlint" -no-color -shellcheck="" -pyflakes="" \
-            .github/workflows/build-push-image.yml \
-            .github/workflows/deploy-via-ssh.yml \
-            .github/workflows/rollback-via-ssh.yml \
-            .github/workflows/validate-reusable-workflows.yml
+            .github/workflows/*.yml
       - name: Validate deploy and rollback invariants
         run: node scripts/test-deploy-handoff-readiness.mjs
