@@ -1163,6 +1163,28 @@ function assertEveryRecreateGoesThroughRetry() {
     workflow.indexOf('compose_up_recreate() {') < workflow.indexOf('compose_up_recreate || return 1'),
     'compose_up_recreate must be defined before its first call site',
   );
+
+  assert.equal(
+    countOccurrences(workflow, 'purge_recreate_ghosts'),
+    2,
+    'ghost purge must have exactly one production call site',
+  );
+  assert.ok(workflow.includes('--filter "label=com.docker.compose.project=\\$compose_project"'));
+  assert.ok(workflow.includes('--filter "label=com.docker.compose.service=\\$svc"'));
+  assert.doesNotMatch(
+    workflow,
+    /grep -E[^\n]*\\\$svc/,
+    'compose service names must never be interpolated into a ghost-name regex',
+  );
+
+  const terminalFailureStart = workflow.indexOf('if [ "\\$attempt" -ge 3 ]; then');
+  const terminalFailureEnd = workflow.indexOf('fi', terminalFailureStart);
+  assert.ok(terminalFailureStart > -1 && terminalFailureEnd > terminalFailureStart);
+  assert.doesNotMatch(
+    workflow.slice(terminalFailureStart, terminalFailureEnd),
+    /purge_recreate_ghosts/,
+    'terminal recreate failure must not purge a service without a recovery attempt',
+  );
 }
 
 /**
@@ -1171,9 +1193,9 @@ function assertEveryRecreateGoesThroughRetry() {
  * workflow em vez de uma copia, senao o teste passa a validar a copia.
  */
 function extractComposeRecreateHelper(workflow) {
-  const start = workflow.indexOf('            compose_up_recreate() {');
+  const start = workflow.indexOf('            purge_recreate_ghosts() {');
   const end = workflow.indexOf('\n\n            public_readiness_ok', start);
-  assert.ok(start > -1 && end > start, 'compose_up_recreate must be extractable');
+  assert.ok(start > -1 && end > start, 'compose ghost purge/recreate helpers must be extractable');
   return workflow
     .slice(start, end)
     .replace(/^ {12}/gm, '')
@@ -1184,37 +1206,198 @@ function extractComposeRecreateHelper(workflow) {
 function runComposeRecreateRetryFixture(workflow) {
   if (!posixShellFixturesAvailable) return false;
 
-  const recreateFunction = extractComposeRecreateHelper(workflow);
+  const recreateFunctions = extractComposeRecreateHelper(workflow);
 
   const fixtureDir = mkdtempSync(resolve(tmpdir(), 'gh-compose-retry-'));
   const fixturePath = resolve(fixtureDir, 'fixture.sh');
   const script = `#!/usr/bin/env bash
 set -euo pipefail
 ALL_SERVICES='backend workers'
-CALLS=0
+MIX_PROJECT_SCOPE=false
 FAIL_TIMES=0
+UP_CALLS=0
+REMOVED_GHOST_BACKEND=false
+REMOVED_GHOST_WORKERS=false
+REMOVED_CANONICAL_BACKEND=false
+REMOVED_FOREIGN_GHOST=false
+REMOVED_SIBLING_GHOST=false
+LOG_FILE="$PWD/operations.log"
+
+container_name() {
+  case "$1" in
+    canonical-backend) printf '%s\n' '/gamehunter-backend-1' ;;
+    ghost-backend) printf '%s\n' '/a1b2c3d4_gamehunter-backend-1' ;;
+    ghost-workers) printf '%s\n' '/b2c3d4e5_gamehunter-workers-1' ;;
+    foreign-ghost) printf '%s\n' '/c3d4e5f6_other-backend-1' ;;
+    sibling-ghost) printf '%s\n' '/d4e5f6a7_gamehunter-backend-helper-1' ;;
+    *) return 1 ;;
+  esac
+}
+
+container_project() {
+  case "$1" in
+    canonical-backend|ghost-backend|ghost-workers|sibling-ghost) printf '%s\n' gamehunter ;;
+    foreign-ghost) printf '%s\n' another-project ;;
+    *) return 1 ;;
+  esac
+}
+
+container_service() {
+  case "$1" in
+    canonical-backend|ghost-backend|foreign-ghost) printf '%s\n' backend ;;
+    ghost-workers) printf '%s\n' workers ;;
+    sibling-ghost) printf '%s\n' backend-helper ;;
+    *) return 1 ;;
+  esac
+}
+
+is_removed() {
+  case "$1" in
+    canonical-backend) [ "$REMOVED_CANONICAL_BACKEND" = true ] ;;
+    ghost-backend) [ "$REMOVED_GHOST_BACKEND" = true ] ;;
+    ghost-workers) [ "$REMOVED_GHOST_WORKERS" = true ] ;;
+    foreign-ghost) [ "$REMOVED_FOREIGN_GHOST" = true ] ;;
+    sibling-ghost) [ "$REMOVED_SIBLING_GHOST" = true ] ;;
+    *) return 1 ;;
+  esac
+}
+
+mark_removed() {
+  case "$1" in
+    canonical-backend) REMOVED_CANONICAL_BACKEND=true ;;
+    ghost-backend) REMOVED_GHOST_BACKEND=true ;;
+    ghost-workers) REMOVED_GHOST_WORKERS=true ;;
+    foreign-ghost) REMOVED_FOREIGN_GHOST=true ;;
+    sibling-ghost) REMOVED_SIBLING_GHOST=true ;;
+    *) return 1 ;;
+  esac
+}
+
+reset_fixture() {
+  UP_CALLS=0
+  REMOVED_GHOST_BACKEND=false
+  REMOVED_GHOST_WORKERS=false
+  REMOVED_CANONICAL_BACKEND=false
+  REMOVED_FOREIGN_GHOST=false
+  REMOVED_SIBLING_GHOST=false
+  : > "$LOG_FILE"
+}
 
 docker() {
-  CALLS=$((CALLS + 1))
-  if [ "$CALLS" -le "$FAIL_TIMES" ]; then
-    echo 'Error response from daemon: cannot remove container: container is running' >&2
-    return 1
+  if [ "$1" = compose ] && [ "$2" = up ]; then
+    UP_CALLS=$((UP_CALLS + 1))
+    printf 'UP %s\n' "$UP_CALLS" >> "$LOG_FILE"
+    if [ "$UP_CALLS" -le "$FAIL_TIMES" ]; then
+      echo 'Error response from daemon: cannot remove container: container is running' >&2
+      return 1
+    fi
+    return 0
   fi
-  return 0
+
+  if [ "$1" = compose ] && [ "$2" = ps ]; then
+    printf '%s\n' canonical-backend ghost-backend ghost-workers sibling-ghost
+    if [ "$MIX_PROJECT_SCOPE" = true ]; then printf '%s\n' foreign-ghost; fi
+    return 0
+  fi
+
+  if [ "$1" = ps ] && [ "$2" = -aq ]; then
+    local arg candidate project_filter='' service_filter=''
+    for arg in "$@"; do
+      case "$arg" in
+        label=com.docker.compose.project=*)
+          project_filter="\${arg#label=com.docker.compose.project=}"
+          ;;
+        label=com.docker.compose.service=*)
+          service_filter="\${arg#label=com.docker.compose.service=}"
+          ;;
+      esac
+    done
+    printf 'FILTER project=%s service=%s\n' "$project_filter" "$service_filter" >> "$LOG_FILE"
+    for candidate in canonical-backend ghost-backend ghost-workers foreign-ghost sibling-ghost; do
+      is_removed "$candidate" && continue
+      [ "$(container_project "$candidate")" = "$project_filter" ] || continue
+      [ "$(container_service "$candidate")" = "$service_filter" ] || continue
+      printf '%s\n' "$candidate"
+    done
+    return 0
+  fi
+
+  if [ "$1" = inspect ] && [ "$2" = --format ]; then
+    case "$3" in
+      '{{.Name}}') container_name "$4" ;;
+      *com.docker.compose.project*) container_project "$4" ;;
+      *com.docker.compose.service*) container_service "$4" ;;
+      *) return 1 ;;
+    esac
+    return $?
+  fi
+
+  if [ "$1" = stop ]; then
+    printf 'STOP %s\n' "\${!#}" >> "$LOG_FILE"
+    return 0
+  fi
+
+  if [ "$1" = rm ]; then
+    printf 'RM %s\n' "\${!#}" >> "$LOG_FILE"
+    mark_removed "\${!#}"
+    return 0
+  fi
+
+  echo "unexpected docker fixture call: $*" >&2
+  return 1
 }
 
 sleep() { :; }
 
-${recreateFunction}
+${recreateFunctions}
+
+# Matching: only hex-prefix ghosts with the exact current Compose project and
+# exact requested service labels may be removed.
+reset_fixture
+purge_recreate_ghosts
+[ "$REMOVED_GHOST_BACKEND" = true ]
+[ "$REMOVED_GHOST_WORKERS" = true ]
+[ "$REMOVED_CANONICAL_BACKEND" = false ]
+[ "$REMOVED_FOREIGN_GHOST" = false ]
+[ "$REMOVED_SIBLING_GHOST" = false ]
+grep -q '^FILTER project=gamehunter service=backend$' "$LOG_FILE"
+grep -q '^FILTER project=gamehunter service=workers$' "$LOG_FILE"
+
+# Idempotencia: uma segunda passagem nao para/remove mais nada.
+remove_count=$(grep -c '^RM ' "$LOG_FILE")
+purge_recreate_ghosts
+[ "$(grep -c '^RM ' "$LOG_FILE")" = "$remove_count" ]
+
+# Mesmo se o comando Compose devolver labels de projects mistos, falha fechado
+# antes de qualquer mutacao.
+reset_fixture
+MIX_PROJECT_SCOPE=true
+if purge_recreate_ghosts >/dev/null 2>&1; then
+  echo 'expected mixed Compose project scope to fail closed'
+  exit 1
+fi
+MIX_PROJECT_SCOPE=false
+if grep -q '^RM ' "$LOG_FILE"; then exit 1; fi
 
 expect() {
   local label="$1" fail_times="$2" want_rc="$3" want_calls="$4" rc=0
-  CALLS=0
+  reset_fixture
   FAIL_TIMES="$fail_times"
   compose_up_recreate >/dev/null 2>&1 || rc=$?
-  if [ "$rc" != "$want_rc" ] || [ "$CALLS" != "$want_calls" ]; then
-    echo "$label: rc=$rc (wanted $want_rc) calls=$CALLS (wanted $want_calls)"
+  if [ "$rc" != "$want_rc" ] || [ "$UP_CALLS" != "$want_calls" ]; then
+    echo "$label: rc=$rc (wanted $want_rc) calls=$UP_CALLS (wanted $want_calls)"
     exit 1
+  fi
+
+  # Todo remove deve ser seguido por uma nova tentativa. O ultimo evento do
+  # caso terminal e a terceira tentativa falha, nunca um purge.
+  awk '
+    /^RM / { pending = 1; next }
+    /^UP / && pending { pending = 0 }
+    END { exit pending ? 1 : 0 }
+  ' "$LOG_FILE"
+  if [ "$want_rc" = 1 ]; then
+    [ "$(tail -n 1 "$LOG_FILE")" = 'UP 3' ]
   fi
 }
 

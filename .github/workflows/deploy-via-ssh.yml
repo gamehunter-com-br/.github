@@ -687,20 +687,71 @@ jobs:
             # shutdown cooperativo) e remove, liberando o nome antes de repetir.
             # Remover o antigo e exatamente o que o recreate ja queria fazer.
             purge_recreate_ghosts() {
-              local ghosts svc c names
-              names=\$(docker ps -a --format '{{.Names}}' || true)
-              ghosts=""
-              for svc in \$ALL_SERVICES; do
-                ghosts="\$ghosts \$(printf '%s\n' "\$names" | grep -E "^[0-9a-f]{8,}_.+-\$svc(-[0-9]+)?\$" || true)"
+              local c compose_ids compose_project ghost_prefix name project_label service_label svc
+
+              # `docker compose ps` ja resolve o project ativo (incluindo
+              # COMPOSE_PROJECT_NAME/--project-name). Extraimos o label dessa
+              # selecao em vez de reconstruir o nome a partir do diretorio.
+              compose_ids=\$(docker compose ps -a -q) || return 1
+              compose_project=""
+              for c in \$compose_ids; do
+                project_label=\$(docker inspect --format \
+                  '{{ index .Config.Labels "com.docker.compose.project" }}' "\$c") || return 1
+                if [ -z "\$project_label" ]; then
+                  echo "FAIL: compose container \$c has no project label"
+                  return 1
+                fi
+                if [ -n "\$compose_project" ] && [ "\$project_label" != "\$compose_project" ]; then
+                  echo "FAIL: docker compose ps crossed project boundaries"
+                  return 1
+                fi
+                compose_project="\$project_label"
               done
-              ghosts=\$(printf '%s' "\$ghosts" | tr ' ' '\n' | grep -v '^\$' | sort -u | xargs || true)
-              if [ -n "\$ghosts" ]; then
-                echo "compose: fantasma(s) de recreate ocupando o nome -- limpando: \$ghosts"
-                for c in \$ghosts; do
+
+              # Sem containers deste project, nao ha fantasma selecionavel com
+              # evidencia suficiente. Falha fechada: nunca varrer outros projects.
+              if [ -z "\$compose_project" ]; then
+                return 0
+              fi
+
+              for svc in \$ALL_SERVICES; do
+                case "\$svc" in
+                  ''|*[!A-Za-z0-9_.-]*)
+                    echo "FAIL: invalid compose service while purging recreate ghosts"
+                    return 1
+                    ;;
+                esac
+
+                while IFS= read -r c; do
+                  [ -n "\$c" ] || continue
+                  name=\$(docker inspect --format '{{.Name}}' "\$c") || continue
+                  name="\${name#/}"
+                  ghost_prefix="\${name%%_*}"
+
+                  # O daemon renomeia o antigo para <id-hex>_<nome>. O teste do
+                  # prefixo e literal; `svc` nunca entra em regex ou glob.
+                  [ "\$ghost_prefix" != "\$name" ] || continue
+                  [ "\${#ghost_prefix}" -ge 8 ] || continue
+                  case "\$ghost_prefix" in *[!0-9a-f]*) continue ;; esac
+
+                  # Revalida os dois labels antes da mutacao. Os filtros de
+                  # `docker ps` e estes compares sao matches exatos.
+                  project_label=\$(docker inspect --format \
+                    '{{ index .Config.Labels "com.docker.compose.project" }}' "\$c") || continue
+                  service_label=\$(docker inspect --format \
+                    '{{ index .Config.Labels "com.docker.compose.service" }}' "\$c") || continue
+                  if [ "\$project_label" != "\$compose_project" ] \
+                    || [ "\$service_label" != "\$svc" ]; then
+                    continue
+                  fi
+
+                  echo "compose: limpando fantasma de recreate: \$name"
                   docker stop -t 60 "\$c" >/dev/null 2>&1 || true
                   docker rm -f "\$c" >/dev/null 2>&1 || true
-                done
-              fi
+                done < <(docker ps -aq \
+                  --filter "label=com.docker.compose.project=\$compose_project" \
+                  --filter "label=com.docker.compose.service=\$svc")
+              done
               return 0
             }
 
@@ -712,10 +763,13 @@ jobs:
                 fi
                 if [ "\$attempt" -ge 3 ]; then
                   echo "FAIL: compose up --force-recreate falhou apos \$attempt tentativas"
-                  purge_recreate_ghosts
                   return 1
                 fi
-                purge_recreate_ghosts
+                # Nunca terminar depois de remover um fantasma: todo purge
+                # pertence a uma tentativa intermediaria e e seguido por um
+                # novo compose up, que recupera o servico canonico.
+                purge_recreate_ghosts \
+                  || echo "WARN: nao foi possivel provar/limpar todos os fantasmas de recreate"
                 echo "compose up --force-recreate falhou (tentativa \$attempt/3) -- repetindo em 5s"
                 attempt=\$(( attempt + 1 ))
                 sleep 5
