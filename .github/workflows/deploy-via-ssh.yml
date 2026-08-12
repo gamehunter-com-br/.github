@@ -559,7 +559,24 @@ jobs:
               GH_IMAGE_DIGEST="\$image_digest"
               export GH_RELEASE_TAG GH_GIT_SHA GH_IMAGE_DIGEST
             }
+
             # ENV_FILE_HARDENING_END
+
+            resolve_current_service_image_id() {
+              local container_id container_ids current_image_id image_id service
+              service="\$1"
+              current_image_id=""
+              container_ids=\$(docker compose ps -q "\$service") || return 1
+              for container_id in \$container_ids; do
+                image_id=\$(docker inspect --format '{{.Image}}' "\$container_id") || return 1
+                if [ -n "\$current_image_id" ] && [ "\$image_id" != "\$current_image_id" ]; then
+                  echo "FAIL: running \$service containers use multiple image IDs; rollback is ambiguous"
+                  return 1
+                fi
+                current_image_id="\$image_id"
+              done
+              printf '%s\n' "\$current_image_id"
+            }
 
             trap 'status=\$?; cleanup_env_tmp; exit \$status' EXIT
 
@@ -571,7 +588,7 @@ jobs:
             CURRENT=""
             ROLLBACK_RELEASE_TAG=""
             if [ "$CUTOVER_MODE" = "standard" ]; then
-              CURRENT=\$(docker compose images "$SERVICE" --quiet 2>/dev/null || true)
+              CURRENT=\$(resolve_current_service_image_id "$SERVICE") || exit 1
               if [ "$RELEASE_IDENTITY_ENABLED" = "true" ]; then
                 if [ ! -f .env ] || [ -L .env ]; then
                   echo "FAIL: .env must be a regular non-symlink file"
@@ -583,7 +600,7 @@ jobs:
                 fi
               fi
               if [ -n "\$CURRENT" ]; then
-                docker tag "\$CURRENT" "$IMAGE:rollback" || true
+                docker tag "\$CURRENT" "$IMAGE:rollback"
               fi
             fi
 
@@ -668,7 +685,7 @@ jobs:
             # entao ele e o que mais raspa a borda.
             #
             # Nao adianta encurtar o drain: a corrida nao e timeout, so muda de
-            # instante. `docker compose up` e convergente e o container ja saiu,
+            # instante. docker compose up e convergente e o container ja saiu,
             # entao a tentativa seguinte remove e recria sem disputa. Falha real
             # continua vermelha -- as tentativas se esgotam e o wait_local_health
             # / rollback a jusante seguem valendo.
@@ -677,7 +694,7 @@ jobs:
             # "cannot remove container: container is running". O nome canonico
             # fica ocupado pelo fantasma e o servico NAO SOBE — a stack fica
             # DOWN ate alguem entrar na mao. Aconteceu 2x em 12/08/2026, nas
-            # duas o backend ficou em `Created` e so voltou com intervencao.
+            # duas o backend ficou em estado Created e so voltou com intervencao.
             #
             # O retry sozinho nao resolve: o container de workers gasta os 120s
             # de SHUTDOWN_DRAIN_MAX_MS em todo deploy, e 3 tentativas de 5s dao
@@ -689,7 +706,7 @@ jobs:
             purge_recreate_ghosts() {
               local c compose_ids compose_project ghost_prefix name project_label service_label svc
 
-              # `docker compose ps` ja resolve o project ativo (incluindo
+              # docker compose ps ja resolve o project ativo (incluindo
               # COMPOSE_PROJECT_NAME/--project-name). Extraimos o label dessa
               # selecao em vez de reconstruir o nome a partir do diretorio.
               compose_ids=\$(docker compose ps -a -q) || return 1
@@ -729,13 +746,13 @@ jobs:
                   ghost_prefix="\${name%%_*}"
 
                   # O daemon renomeia o antigo para <id-hex>_<nome>. O teste do
-                  # prefixo e literal; `svc` nunca entra em regex ou glob.
+                  # prefixo e literal; svc nunca entra em regex ou glob.
                   [ "\$ghost_prefix" != "\$name" ] || continue
                   [ "\${#ghost_prefix}" -ge 8 ] || continue
                   case "\$ghost_prefix" in *[!0-9a-f]*) continue ;; esac
 
                   # Revalida os dois labels antes da mutacao. Os filtros de
-                  # `docker ps` e estes compares sao matches exatos.
+                  # docker ps e estes compares sao matches exatos.
                   project_label=\$(docker inspect --format \
                     '{{ index .Config.Labels "com.docker.compose.project" }}' "\$c") || continue
                   service_label=\$(docker inspect --format \
