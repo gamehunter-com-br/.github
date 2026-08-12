@@ -101,10 +101,11 @@ function simulateRollbackWhileCandidateProtectsTraffic() {
 function assertWorkflowKeepsGuardBeforeRecreate() {
   const workflow = readFileSync(deployWorkflowPath, 'utf8');
   const prepareIndex = workflow.lastIndexOf('            prepare_public_handoff');
-  const recreateIndex = workflow.indexOf(
-    'docker compose up -d --no-build --force-recreate \\$ALL_SERVICES',
-    prepareIndex,
-  );
+  // O recreate canonico passa por `compose_up_recreate` (retry da corrida
+  // exit-vs-remove do daemon); o `docker compose up` cru so existe dentro do
+  // helper, bem acima deste ponto. A invariante checada aqui continua sendo a
+  // ordem: handoff publico ANTES de derrubar o canonico.
+  const recreateIndex = workflow.indexOf('compose_up_recreate', prepareIndex);
 
   assert.ok(prepareIndex > -1, 'workflow must define/call prepare_public_handoff');
   assert.ok(recreateIndex > -1, 'workflow must still recreate compose services');
@@ -427,7 +428,10 @@ function assertProtectedModeContract() {
   const forceStart = protectedBlock.indexOf('force_same_image_capture_off()');
   const forceEnd = protectedBlock.indexOf('ensure_protected_queue_paused()', forceStart);
   const forceBlock = protectedBlock.slice(forceStart, forceEnd);
-  assert.ok(forceBlock.indexOf('docker compose stop') < forceBlock.indexOf('docker compose up'));
+  // `compose_up_recreate` e o recreate (retry da corrida exit-vs-remove); a
+  // invariante segue sendo stop ANTES de subir de novo.
+  assert.ok(forceBlock.indexOf('docker compose stop') < forceBlock.indexOf('compose_up_recreate'));
+  assert.ok(forceBlock.includes('compose_up_recreate'), 'capture-off must recreate through the retry helper');
 
   assert.match(
     rollback,
@@ -938,6 +942,8 @@ wait_public_readiness() { record "PUBLIC_HEALTH $*"; [ "$FAIL_PHASE" != health ]
 public_readiness_ok() { [ "$FAIL_PHASE" != health ]; }
 sleep() { :; }
 
+${extractComposeRecreateHelper(workflow)}
+
 ${protectedBlock}
 
 # The fixture exercises the protected gates and substitutes only container
@@ -1122,12 +1128,126 @@ assert.equal(guarded.afterCanonicalStart.ok, true);
 assert.equal(guarded.finalCanonicalOnly.ok, true);
 assert.equal(guarded.finalCanonicalOnly.servedBy, 'canonical-new');
 
+/**
+ * O recreate morre numa corrida do daemon, nao num timeout.
+ *
+ * Producao 2026-08-12: gamehunter-workers-1 saiu LIMPO as 01:12:53.242
+ * (exitStatus {0}, hasBeenManuallyStopped=true, dentro do stop_grace_period de
+ * 240s) e o remove do compose chegou 0.38s depois, ainda ouvindo "container is
+ * running". Deploy vermelho com app saudavel, prod split-version. No mesmo
+ * deploy o backend teve 0.8s de folga e passou — a janela e sub-segundo.
+ *
+ * Por isso todo recreate passa por `compose_up_recreate`. Se alguem reintroduzir
+ * um `docker compose up --force-recreate` cru, volta a corrida sem retry.
+ */
+function assertEveryRecreateGoesThroughRetry() {
+  const workflow = readFileSync(deployWorkflowPath, 'utf8');
+  const rawRecreates = workflow.split('docker compose up -d --no-build --force-recreate').length - 1;
+  assert.equal(
+    rawRecreates,
+    1,
+    'only compose_up_recreate may call docker compose up --force-recreate directly',
+  );
+  assert.ok(
+    workflow.includes('compose_up_recreate() {'),
+    'deploy workflow must define compose_up_recreate',
+  );
+  // Definicao + os call sites; sem isso o helper existiria sem ninguem usar.
+  const references = workflow.split('compose_up_recreate').length - 1;
+  assert.ok(
+    references >= 5,
+    `expected recreate call sites to route through the retry helper, found ${references}`,
+  );
+  // A definicao precisa vir antes da primeira chamada: shell resolve funcao em runtime.
+  assert.ok(
+    workflow.indexOf('compose_up_recreate() {') < workflow.indexOf('compose_up_recreate || return 1'),
+    'compose_up_recreate must be defined before its first call site',
+  );
+}
+
+/**
+ * O helper de recreate, dedentado e com os escapes do heredoc resolvidos —
+ * exatamente como ele chega na VPS. As fixtures rodam a definicao REAL do
+ * workflow em vez de uma copia, senao o teste passa a validar a copia.
+ */
+function extractComposeRecreateHelper(workflow) {
+  const start = workflow.indexOf('            compose_up_recreate() {');
+  const end = workflow.indexOf('\n\n            public_readiness_ok', start);
+  assert.ok(start > -1 && end > start, 'compose_up_recreate must be extractable');
+  return workflow
+    .slice(start, end)
+    .replace(/^ {12}/gm, '')
+    .replace(/\\\$/g, () => '$');
+}
+
+/** Exercita o helper real, extraido do workflow, contra um docker falso. */
+function runComposeRecreateRetryFixture(workflow) {
+  if (!posixShellFixturesAvailable) return false;
+
+  const recreateFunction = extractComposeRecreateHelper(workflow);
+
+  const fixtureDir = mkdtempSync(resolve(tmpdir(), 'gh-compose-retry-'));
+  const fixturePath = resolve(fixtureDir, 'fixture.sh');
+  const script = `#!/usr/bin/env bash
+set -euo pipefail
+ALL_SERVICES='backend workers'
+CALLS=0
+FAIL_TIMES=0
+
+docker() {
+  CALLS=$((CALLS + 1))
+  if [ "$CALLS" -le "$FAIL_TIMES" ]; then
+    echo 'Error response from daemon: cannot remove container: container is running' >&2
+    return 1
+  fi
+  return 0
+}
+
+sleep() { :; }
+
+${recreateFunction}
+
+expect() {
+  local label="$1" fail_times="$2" want_rc="$3" want_calls="$4" rc=0
+  CALLS=0
+  FAIL_TIMES="$fail_times"
+  compose_up_recreate >/dev/null 2>&1 || rc=$?
+  if [ "$rc" != "$want_rc" ] || [ "$CALLS" != "$want_calls" ]; then
+    echo "$label: rc=$rc (wanted $want_rc) calls=$CALLS (wanted $want_calls)"
+    exit 1
+  fi
+}
+
+expect 'clean first attempt' 0 0 1
+expect 'exit-vs-remove race recovers' 1 0 2
+expect 'two races still recover' 2 0 3
+expect 'real failure stays red' 999 1 3
+`;
+
+  try {
+    writeFileSync(fixturePath, script, { mode: 0o700 });
+    const result = spawnSync('bash', [fixturePath], {
+      cwd: fixtureDir,
+      encoding: 'utf8',
+    });
+    assert.equal(
+      result.status,
+      0,
+      `compose recreate retry fixture failed:\n${result.stdout}${result.stderr}`,
+    );
+  } finally {
+    rmSync(fixtureDir, { force: true, recursive: true });
+  }
+  return true;
+}
+
 const rollback = simulateRollbackWhileCandidateProtectsTraffic();
 assert.equal(rollback.duringFailedDeploy.ok, true, 'candidate protects public traffic while rollback recreates canonical');
 assert.equal(rollback.afterRollback.ok, true);
 assert.equal(rollback.afterRollback.servedBy, 'canonical-rollback');
 
 assertWorkflowKeepsGuardBeforeRecreate();
+assertEveryRecreateGoesThroughRetry();
 assertRollbackTagIsValidatedBeforeSsh();
 assertDeployUsesOneHardenedSshSession();
 assertDeployTagInputIsNotInterpolatedIntoShellSource();
@@ -1143,6 +1263,7 @@ const functionalFixtureRan = [
 ].some(Boolean);
 const runtimePolicyFixtureRan = runRuntimePolicyFixture(deployEnv.workflow);
 const protectedFixtureRan = runProtectedFlowFixture(deployEnv.workflow);
+const composeRetryFixtureRan = runComposeRecreateRetryFixture(deployEnv.workflow);
 
 console.log('deploy handoff readiness fixture PASS');
 console.log('deploy/rollback env hardening structural fixture PASS');
@@ -1160,4 +1281,10 @@ console.log(
   protectedFixtureRan
     ? 'protected release POSIX failure matrix PASS'
     : 'protected release POSIX failure matrix SKIP (requires POSIX shell)',
+);
+console.log('recreate retry structural fixture PASS');
+console.log(
+  composeRetryFixtureRan
+    ? 'compose recreate exit-vs-remove retry fixture PASS'
+    : 'compose recreate exit-vs-remove retry fixture SKIP (requires POSIX shell)',
 );

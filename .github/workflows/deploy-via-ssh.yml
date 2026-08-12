@@ -648,6 +648,46 @@ jobs:
             PUBLIC_ATTEMPTS=\$(( (PUBLIC_TIMEOUT + 1) / 2 ))
             if [ "\$PUBLIC_ATTEMPTS" -lt 1 ]; then PUBLIC_ATTEMPTS=1; fi
 
+            # Recria os servicos tolerando a corrida exit-vs-remove do daemon.
+            #
+            # Medido em producao (gamehunter-backend, 2026-08-12): o
+            # gamehunter-workers-1 saiu LIMPO -- exitStatus {0},
+            # hasBeenManuallyStopped=true, restartCount=0, dentro do
+            # stop_grace_period de 240s -- as 01:12:53.242, e o remove do
+            # compose chegou as 01:12:53.620. 0.38s depois, com o daemon ainda
+            # respondendo "container is running: stop the container before
+            # removing". Deploy vermelho com a aplicacao perfeitamente
+            # saudavel: a prod ficou split-version (backend novo, workers
+            # velho) ate convergir sozinha.
+            #
+            # A janela e sub-segundo e depende de quanto o shutdown demora: no
+            # mesmo deploy o backend passou pela mesma sequencia com 0.8s de
+            # folga e sobreviveu. O container de workers gasta os 120s de
+            # SHUTDOWN_DRAIN_MAX_MS em TODO deploy (o ledger registra
+            # "drained after 120xxxms timeout" em todos os restarts medidos),
+            # entao ele e o que mais raspa a borda.
+            #
+            # Nao adianta encurtar o drain: a corrida nao e timeout, so muda de
+            # instante. `docker compose up` e convergente e o container ja saiu,
+            # entao a tentativa seguinte remove e recria sem disputa. Falha real
+            # continua vermelha -- as tentativas se esgotam e o wait_local_health
+            # / rollback a jusante seguem valendo.
+            compose_up_recreate() {
+              local attempt=1
+              while : ; do
+                if docker compose up -d --no-build --force-recreate \$ALL_SERVICES; then
+                  return 0
+                fi
+                if [ "\$attempt" -ge 3 ]; then
+                  echo "FAIL: compose up --force-recreate falhou apos \$attempt tentativas"
+                  return 1
+                fi
+                echo "compose up --force-recreate falhou (tentativa \$attempt/3) -- repetindo em 5s"
+                attempt=\$(( attempt + 1 ))
+                sleep 5
+              done
+            }
+
             public_readiness_ok() {
               local absolute_deadline="\${1:-0}"
               local check host path max_time remaining
@@ -1105,7 +1145,7 @@ jobs:
               update_image_tag_env \
                 "\$IMAGE_TAG" "$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
                 false disabled false || return 1
-              docker compose up -d --no-build --force-recreate \$ALL_SERVICES || return 1
+              compose_up_recreate || return 1
               assert_running_release_identity \
                 "$IMAGE:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
                 false disabled false || return 1
@@ -1325,7 +1365,7 @@ jobs:
                     docker compose run -T --rm --no-deps "$SERVICE" \
                       $MIGRATION_CMD < /dev/null || return 1
                   fi
-                  docker compose up -d --no-build --force-recreate \$ALL_SERVICES || return 1
+                  compose_up_recreate || return 1
                   assert_running_release_identity \
                     "$IMAGE:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
                     false disabled false || return 1
@@ -1346,7 +1386,7 @@ jobs:
                     "$TAG" "$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
                     true tag true || return 1
                   PROTECTED_MUTATED=true
-                  docker compose up -d --no-build --force-recreate \$ALL_SERVICES || return 1
+                  compose_up_recreate || return 1
                   assert_running_release_identity \
                     "$IMAGE:$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
                     true tag true || return 1
@@ -1515,7 +1555,7 @@ jobs:
               else
                 update_image_tag_env "\$IMAGE_TAG"
               fi
-              docker compose up -d --no-build --force-recreate \$ALL_SERVICES
+              compose_up_recreate
 
               PORT=\$(grep "^PORT=" .env | cut -d= -f2 | head -1)
               PORT=\${PORT:-$DEFAULT_PORT}
@@ -1552,7 +1592,7 @@ jobs:
             fi
 
             prepare_public_handoff
-            docker compose up -d --no-build --force-recreate \$ALL_SERVICES
+            compose_up_recreate
 
             PORT=\$(grep "^PORT=" .env | cut -d= -f2 | head -1)
             PORT=\${PORT:-$DEFAULT_PORT}
