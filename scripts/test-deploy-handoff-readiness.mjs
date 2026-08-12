@@ -1188,6 +1188,109 @@ function assertEveryRecreateGoesThroughRetry() {
 }
 
 /**
+ * O heredoc SSH e expandido pelo runner antes de seguir para a VPS. Crases em
+ * comentarios viram comandos locais, e uma lista de IDs nao pode ser usada
+ * como a imagem unica de rollback.
+ */
+function assertDeployHeredocAndRollbackImageAreUnambiguous() {
+  const workflow = readFileSync(deployWorkflowPath, 'utf8');
+  const heredocStart = workflow.indexOf("'bash -euo pipefail -s' << EOF");
+  const heredocEnd = workflow.indexOf('\n          EOF', heredocStart);
+  assert.ok(heredocStart > -1 && heredocEnd > heredocStart, 'deploy SSH heredoc must be extractable');
+  const heredoc = workflow.slice(heredocStart, heredocEnd);
+
+  assert.doesNotMatch(
+    heredoc,
+    /`/,
+    'raw backticks inside the expanding SSH heredoc execute on the Actions runner',
+  );
+  assert.ok(workflow.includes('resolve_current_service_image_id() {'));
+  assert.ok(workflow.includes('CURRENT=\\$(resolve_current_service_image_id "$SERVICE") || exit 1'));
+  assert.ok(workflow.includes('docker inspect --format \'{{.Image}}\' "\\$container_id"'));
+  assert.ok(workflow.includes('running \\$service containers use multiple image IDs'));
+  assert.doesNotMatch(
+    workflow,
+    /docker compose images "\$SERVICE" --quiet/,
+    'compose images may return several IDs and must not define the rollback tag',
+  );
+  assert.ok(workflow.includes('docker tag "\\$CURRENT" "$IMAGE:rollback"'));
+  assert.doesNotMatch(
+    workflow,
+    /docker tag "\\\$CURRENT" "\$IMAGE:rollback" \|\| true/,
+    'a failed rollback tag must fail before the canonical service is mutated',
+  );
+}
+
+function extractCurrentServiceImageHelper(workflow) {
+  const start = workflow.indexOf('            resolve_current_service_image_id() {');
+  const end = workflow.indexOf('\n\n            trap ', start);
+  assert.ok(start > -1 && end > start, 'rollback image helper must be extractable');
+  return workflow
+    .slice(start, end)
+    .replace(/^ {12}/gm, '')
+    .replace(/\\\$/g, () => '$');
+}
+
+function runCurrentServiceImageFixture(workflow) {
+  if (!posixShellFixturesAvailable) return false;
+  const helper = extractCurrentServiceImageHelper(workflow);
+  const fixtureDir = mkdtempSync(resolve(tmpdir(), 'gh-current-image-'));
+  const fixturePath = resolve(fixtureDir, 'fixture.sh');
+  const script = `#!/usr/bin/env bash
+set -euo pipefail
+MODE=one
+
+docker() {
+  if [ "$1" = compose ] && [ "$2" = ps ]; then
+    case "$MODE" in
+      none) return 0 ;;
+      one) printf '%s\n' app-1 ;;
+      same) printf '%s\n' app-1 app-2 ;;
+      mixed) printf '%s\n' app-1 app-3 ;;
+    esac
+    return 0
+  fi
+  if [ "$1" = inspect ] && [ "$2" = --format ]; then
+    case "$4" in
+      app-1|app-2) printf '%s\n' sha256:one ;;
+      app-3) printf '%s\n' sha256:two ;;
+      *) return 1 ;;
+    esac
+    return 0
+  fi
+  return 1
+}
+
+${helper}
+
+MODE=none
+[ -z "$(resolve_current_service_image_id backend)" ]
+MODE=one
+[ "$(resolve_current_service_image_id backend)" = sha256:one ]
+MODE=same
+[ "$(resolve_current_service_image_id backend)" = sha256:one ]
+MODE=mixed
+if resolve_current_service_image_id backend >/dev/null 2>&1; then
+  echo 'expected mixed running images to fail closed'
+  exit 1
+fi
+`;
+
+  try {
+    writeFileSync(fixturePath, script, { mode: 0o700 });
+    const result = spawnSync('bash', [fixturePath], { cwd: fixtureDir, encoding: 'utf8' });
+    assert.equal(
+      result.status,
+      0,
+      `current service image fixture failed:\n${result.stdout}${result.stderr}`,
+    );
+  } finally {
+    rmSync(fixtureDir, { force: true, recursive: true });
+  }
+  return true;
+}
+
+/**
  * O helper de recreate, dedentado e com os escapes do heredoc resolvidos —
  * exatamente como ele chega na VPS. As fixtures rodam a definicao REAL do
  * workflow em vez de uma copia, senao o teste passa a validar a copia.
@@ -1431,6 +1534,7 @@ assert.equal(rollback.afterRollback.servedBy, 'canonical-rollback');
 
 assertWorkflowKeepsGuardBeforeRecreate();
 assertEveryRecreateGoesThroughRetry();
+assertDeployHeredocAndRollbackImageAreUnambiguous();
 assertRollbackTagIsValidatedBeforeSsh();
 assertDeployUsesOneHardenedSshSession();
 assertDeployTagInputIsNotInterpolatedIntoShellSource();
@@ -1447,6 +1551,7 @@ const functionalFixtureRan = [
 const runtimePolicyFixtureRan = runRuntimePolicyFixture(deployEnv.workflow);
 const protectedFixtureRan = runProtectedFlowFixture(deployEnv.workflow);
 const composeRetryFixtureRan = runComposeRecreateRetryFixture(deployEnv.workflow);
+const currentImageFixtureRan = runCurrentServiceImageFixture(deployEnv.workflow);
 
 console.log('deploy handoff readiness fixture PASS');
 console.log('deploy/rollback env hardening structural fixture PASS');
@@ -1470,4 +1575,9 @@ console.log(
   composeRetryFixtureRan
     ? 'compose recreate exit-vs-remove retry fixture PASS'
     : 'compose recreate exit-vs-remove retry fixture SKIP (requires POSIX shell)',
+);
+console.log(
+  currentImageFixtureRan
+    ? 'current service rollback image fixture PASS'
+    : 'current service rollback image fixture SKIP (requires POSIX shell)',
 );
