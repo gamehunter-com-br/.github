@@ -41,32 +41,59 @@ jobs:
     name: Create next semver tag
     runs-on: ${{ inputs.runner }}
     steps:
+      # PRESENCA NAO E VALIDADE.
+      #
+      # Ate 20/08/2026 este passo so testava `[ -z "$TOKEN" ]` — e saiu `success`
+      # com o PAT ja quebrado no release do gamehunter-frontend v3.47.3. O modo
+      # de falha provavel de um PAT nao e sumir: e expirar ou ser revogado. O
+      # guard que existe pra pegar problema de token deixava passar justamente o
+      # problema de token mais comum, e quem gritava era o passo seguinte, com a
+      # mensagem de OUTRO assunto.
+      #
+      # `git ls-remote` custa um round-trip e falha fechado aqui, onde a mensagem
+      # pode nomear o culpado.
       - name: Require release token
         env:
           RELEASE_TAG_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
         run: |
-          if [ -z "$RELEASE_TAG_TOKEN" ]; then
+          set -uo pipefail
+          if [ -z "${RELEASE_TAG_TOKEN:-}" ]; then
             echo "::error::Configure RELEASE_TAG_TOKEN with permission to push tags. Tags pushed with GITHUB_TOKEN do not trigger downstream workflows."
             exit 1
           fi
-
+          if ! git ls-remote "https://x-access-token:${RELEASE_TAG_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD >/dev/null 2>&1; then
+            echo "::error::RELEASE_TAG_TOKEN esta presente mas o GitHub o recusou (expirado, revogado ou sem escopo). NAO e problema do commit nem da branch. O segredo e de ORGANIZACAO, entao a rotacao conserta os 8 repos de uma vez."
+            exit 1
+          fi
       - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
           persist-credentials: false
 
+      # FETCH MORTO E REF FORA DA MAIN SAO FATOS DIFERENTES.
+      #
+      # Este passo rodava `set -euo pipefail` e comecava pelo `git fetch`
+      # autenticado. Com token recusado o script terminava ali, exit 128, SEM
+      # imprimir o `::error::` abaixo — e o nome do passo virava a unica pista,
+      # mandando conferir a ancestralidade de um commit que estava na main.
+      # Foi o que aconteceu no release do frontend v3.47.3 (556a263e).
+      #
+      # O `if !` mantem o `set -e` (comando em condicao de `if` nao dispara -e) e
+      # da a cada falha a sua propria mensagem.
       - name: Require release ref on main
         env:
           RELEASE_TAG_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
         run: |
           set -euo pipefail
-          git fetch --force "https://x-access-token:${RELEASE_TAG_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main:refs/remotes/origin/main
+          if ! git fetch --force "https://x-access-token:${RELEASE_TAG_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main:refs/remotes/origin/main; then
+            echo "::error::Falhou o fetch de origin/main com RELEASE_TAG_TOKEN. Isto NAO diz nada sobre onde o commit esta — a ancestralidade nem chegou a ser avaliada. Ver o passo 'Require release token' e a rede do runner."
+            exit 1
+          fi
           if ! git merge-base --is-ancestor HEAD origin/main; then
             echo "::error::Release ref '${{ inputs.ref }}' is not reachable from origin/main. Merge this commit to main, then promote the release tag from main."
             exit 1
           fi
-
       - name: Compute next tag
         id: next
         env:
