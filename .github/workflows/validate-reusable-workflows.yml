@@ -47,3 +47,9 @@ jobs:
             .github/workflows/*.yml
       - name: Validate deploy and rollback invariants
         run: node scripts/test-deploy-handoff-readiness.mjs
+
+      # Guarda a mensagem, nao so o comportamento: o promote-release precisa
+      # dizer QUAL coisa quebrou. Em 20/08/2026 ele culpou a ancestralidade do
+      # commit quando o problema era o RELEASE_TAG_TOKEN.
+      - name: Validate promote-release failure messages
+        run: node scripts/test-promote-release-messages.mjs
