@@ -85,6 +85,43 @@ jobs:
             exit 1
           fi
 
+      # O guard acima garante que a tag esta NA main, mas aceita 'behind' — ou seja,
+      # uma tag num commit ANCESTRAL passa. Foi assim que v2.91.1 (commit de 18/08)
+      # deployou por cima de v2.91.0 e levou o backend 11 commits para tras em
+      # 20/08/2026, sem gerar um unico erro: a API respondeu 200 o tempo todo, so
+      # que sem os campos novos. Ver gamehunter-specs/runbooks/release-tag-ordem-semver.md.
+      - name: Require release tag to advance the previous release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PREV=$(git ls-remote --tags --refs origin \
+            | sed 's#.*refs/tags/##' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | grep -vxF "${GITHUB_REF_NAME}" \
+            | sort -V | tail -1)
+          if [ -z "$PREV" ]; then
+            echo "::notice::Nenhuma tag semver anterior — nada a comparar."
+            exit 0
+          fi
+
+          # 1) a tag nova precisa ser a MAIOR. Uma tag menor apontando para commit
+          #    novo quebra qualquer resolucao de "ultima versao" por sort -V.
+          HIGHEST=$(printf '%s\n%s\n' "$PREV" "${GITHUB_REF_NAME}" | sort -V | tail -1)
+          if [ "$HIGHEST" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} is lower than the existing ${PREV}. Escolha um numero maior que ${PREV}."
+            exit 1
+          fi
+
+          # 2) e o commit precisa DESCENDER do commit da tag anterior.
+          STATUS=$(gh api "/repos/${GITHUB_REPOSITORY}/compare/${PREV}...${GITHUB_SHA}" --jq '.status')
+          if [[ "$STATUS" != "ahead" && "$STATUS" != "identical" ]]; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) does not advance ${PREV} (compare status: $STATUS). Uma tag maior num commit ancestral deploya codigo antigo em silencio. Recrie a tag a partir da main."
+            exit 1
+          fi
+          echo "::notice::${GITHUB_REF_NAME} avanca ${PREV} (compare: $STATUS)."
+
       - name: Compute image tags
         id: meta
         run: |
