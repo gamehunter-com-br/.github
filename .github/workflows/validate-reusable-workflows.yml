@@ -2,9 +2,13 @@ name: Validate reusable workflows
 
 on:
   pull_request:
-    paths:
-      - '.github/workflows/**'
-      - 'scripts/test-deploy-handoff-readiness.mjs'
+    # Sem filtro de paths: este job e REQUIRED CHECK na main desde 21/08/2026. Com filtro, um PR
+    # que nao toca os paths listados nunca dispara o check e fica BLOCKED para sempre — a licao do
+    # PR #1605, ja aplicada no ci.yml dos 4 apps e no spec-lint.yml do gamehunter-specs. O job e
+    # deterministic (actionlint sobre glob + dois scripts node, sem olhar arquivo alterado) e roda
+    # em runner hospedado, entao rodar sempre custa ~1 min e nao toca o pool da E1.
+    #
+    # O filtro continua no push, onde nao ha check para travar.
   push:
     branches:
       - main
