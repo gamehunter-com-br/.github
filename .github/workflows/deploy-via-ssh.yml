@@ -858,12 +858,10 @@ jobs:
               for check in \$PUBLIC_CHECKS; do
                 host="\${check%%:*}"
                 path="\${check#*:}"
-                if [ "$SERVICE" = "backend" ]; then
-                  case "\$path" in
-                    /api/*|/health) ;;
-                    *) continue ;;
-                  esac
-                fi
+                # Toda rota declarada pelo caller precisa passar no candidato
+                # isolado. Pular paginas do backend deixa o gate publico medir
+                # um pool misto e permite que a versao canonica velha decida o
+                # resultado do deploy da correcao.
                 checked=1
                 curl -fsS --connect-timeout 2 --max-time 8 \
                   -H "Host: \$host" \

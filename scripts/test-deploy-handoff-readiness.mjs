@@ -1305,6 +1305,73 @@ function extractComposeRecreateHelper(workflow) {
     .replace(/\\\$/g, () => '$');
 }
 
+/** A funcao real que valida a matriz diretamente contra o candidato isolado. */
+function extractCandidateDirectReadinessHelper(workflow) {
+  const start = workflow.indexOf('            candidate_direct_readiness_ok() {');
+  const end = workflow.indexOf('\n\n            wait_candidate_direct_readiness()', start);
+  assert.ok(start > -1 && end > start, 'candidate direct readiness helper must be extractable');
+  return workflow
+    .slice(start, end)
+    .replace(/^ {12}/gm, '')
+    .replace(/\\\$/g, () => '$');
+}
+
+/** Prova que rotas de pagina do backend nao sao puladas no candidato. */
+function runCandidateDirectReadinessFixture(workflow) {
+  if (!posixShellFixturesAvailable) return false;
+
+  const readinessFunction = extractCandidateDirectReadinessHelper(workflow);
+  const fixtureDir = mkdtempSync(resolve(tmpdir(), 'gh-candidate-readiness-'));
+  const fixturePath = resolve(fixtureDir, 'fixture.sh');
+  const script = `#!/usr/bin/env bash
+set -euo pipefail
+SERVICE=backend
+HANDOFF_CANDIDATE_PORT=13001
+LOG_FILE='${resolve(fixtureDir, 'curl.log')}'
+FAIL_PAGE=false
+
+curl() {
+  printf '%s\\n' "$*" >> "$LOG_FILE"
+  if [ "$FAIL_PAGE" = true ] && [[ "$*" == *'/jogo/red-dead-redemption-2'* ]]; then
+    return 22
+  fi
+  return 0
+}
+
+${readinessFunction}
+
+PUBLIC_CHECKS='gamehunter.com.br:/api/health gamehunter.com.br:/jogo/red-dead-redemption-2'
+candidate_direct_readiness_ok
+grep -q '/api/health' "$LOG_FILE"
+grep -q '/jogo/red-dead-redemption-2' "$LOG_FILE"
+
+: > "$LOG_FILE"
+PUBLIC_CHECKS='gamehunter.com.br:/jogo/red-dead-redemption-2'
+FAIL_PAGE=true
+if candidate_direct_readiness_ok; then
+  echo 'backend page failure was skipped by candidate direct readiness'
+  exit 1
+fi
+grep -q '/jogo/red-dead-redemption-2' "$LOG_FILE"
+`;
+
+  try {
+    writeFileSync(fixturePath, script, { mode: 0o700 });
+    const result = spawnSync('bash', [fixturePath], {
+      cwd: fixtureDir,
+      encoding: 'utf8',
+    });
+    assert.equal(
+      result.status,
+      0,
+      `candidate direct readiness fixture failed:\n${result.stdout}${result.stderr}`,
+    );
+  } finally {
+    rmSync(fixtureDir, { force: true, recursive: true });
+  }
+  return true;
+}
+
 /** Exercita o helper real, extraido do workflow, contra um docker falso. */
 function runComposeRecreateRetryFixture(workflow) {
   if (!posixShellFixturesAvailable) return false;
@@ -1552,6 +1619,7 @@ const runtimePolicyFixtureRan = runRuntimePolicyFixture(deployEnv.workflow);
 const protectedFixtureRan = runProtectedFlowFixture(deployEnv.workflow);
 const composeRetryFixtureRan = runComposeRecreateRetryFixture(deployEnv.workflow);
 const currentImageFixtureRan = runCurrentServiceImageFixture(deployEnv.workflow);
+const candidateDirectReadinessFixtureRan = runCandidateDirectReadinessFixture(deployEnv.workflow);
 
 console.log('deploy handoff readiness fixture PASS');
 console.log('deploy/rollback env hardening structural fixture PASS');
@@ -1580,4 +1648,9 @@ console.log(
   currentImageFixtureRan
     ? 'current service rollback image fixture PASS'
     : 'current service rollback image fixture SKIP (requires POSIX shell)',
+);
+console.log(
+  candidateDirectReadinessFixtureRan
+    ? 'backend candidate direct page readiness fixture PASS'
+    : 'backend candidate direct page readiness fixture SKIP (requires POSIX shell)',
 );
