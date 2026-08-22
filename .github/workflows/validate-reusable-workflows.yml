@@ -57,3 +57,10 @@ jobs:
       # commit quando o problema era o RELEASE_TAG_TOKEN.
       - name: Validate promote-release failure messages
         run: node scripts/test-promote-release-messages.mjs
+
+      # Este teste nasceu no mesmo PR que a regex (#11) e ficou FORA do validator: guarda que
+      # nunca roda nao guarda nada. Ele extrai o WORKER_DEPLOY_RE do proprio workflow e afirma
+      # que mudanca em servico de afiliado forca deploy de worker — sem o step, um typo na regex
+      # passa batido e o worker deixa de reiniciar em silencio, que e o bug que o PR conserta.
+      - name: Validate worker deploy regex contract
+        run: node scripts/test-worker-deploy-regex.mjs
