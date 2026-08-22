@@ -1316,7 +1316,16 @@ function extractCandidateDirectReadinessHelper(workflow) {
     .replace(/\\\$/g, () => '$');
 }
 
-/** Prova que rotas de pagina do backend nao sao puladas no candidato. */
+/**
+ * Prova o contrato do gate de readiness DIRETA no candidato: ele curla o
+ * container do servico sem passar pelo nginx, entao so pode exercitar path
+ * que aquele servico serve.
+ *
+ * Regressao guardada: .github#37 removeu o filtro por servico e todo deploy de
+ * backend passou a curlar /jogo, /calendario-lancamentos e /empresas contra um
+ * container de backend -- 404 constante e FAIL apos 90s em 100% dos deploys
+ * (run 32571431839, GAM-552/GAM-553).
+ */
 function runCandidateDirectReadinessFixture(workflow) {
   if (!posixShellFixturesAvailable) return false;
 
@@ -1325,33 +1334,62 @@ function runCandidateDirectReadinessFixture(workflow) {
   const fixturePath = resolve(fixtureDir, 'fixture.sh');
   const script = `#!/usr/bin/env bash
 set -euo pipefail
-SERVICE=backend
 HANDOFF_CANDIDATE_PORT=13001
 LOG_FILE='${resolve(fixtureDir, 'curl.log')}'
-FAIL_PAGE=false
+FAIL_API=false
 
 curl() {
-  printf '%s\\n' "$*" >> "$LOG_FILE"
-  if [ "$FAIL_PAGE" = true ] && [[ "$*" == *'/jogo/red-dead-redemption-2'* ]]; then
+  printf '%s\n' "$*" >> "$LOG_FILE"
+  if [ "$FAIL_API" = true ] && [[ "$*" == *'/api/health'* ]]; then
     return 22
   fi
   return 0
 }
 
+SERVICE=backend
 ${readinessFunction}
 
-PUBLIC_CHECKS='gamehunter.com.br:/api/health gamehunter.com.br:/jogo/red-dead-redemption-2'
+# 1. Matriz mista: o backend valida so o que ele serve. Pagina do Next fica
+#    para o gate publico pos-cutover, que passa pelo nginx.
+PUBLIC_CHECKS='gamehunter.com.br:/api/health gamehunter.com.br:/health gamehunter.com.br:/jogo/red-dead-redemption-2'
 candidate_direct_readiness_ok
 grep -q '/api/health' "$LOG_FILE"
-grep -q '/jogo/red-dead-redemption-2' "$LOG_FILE"
-
-: > "$LOG_FILE"
-PUBLIC_CHECKS='gamehunter.com.br:/jogo/red-dead-redemption-2'
-FAIL_PAGE=true
-if candidate_direct_readiness_ok; then
-  echo 'backend page failure was skipped by candidate direct readiness'
+grep -q ':13001/health' "$LOG_FILE"
+if grep -q '/jogo/red-dead-redemption-2' "$LOG_FILE"; then
+  echo 'backend candidate curled a frontend page path'
   exit 1
 fi
+
+# 2. So paginas: nada a exercitar no candidato do backend. Tem de passar e
+#    dizer que pulou -- e este o caso que quebrava 100% dos deploys.
+( : > "$LOG_FILE" )
+PUBLIC_CHECKS='gamehunter.com.br:/jogo/red-dead-redemption-2 gamehunter.com.br:/empresas/kaizen-game-works'
+saida="$(candidate_direct_readiness_ok)"
+case "$saida" in
+  *'no backend-owned public paths'*) ;;
+  *) echo "esperava aviso de skip, veio: $saida"; exit 1 ;;
+esac
+if [ -s "$LOG_FILE" ]; then
+  echo 'backend candidate curled something with page-only checks'
+  exit 1
+fi
+
+# 3. O filtro nao afrouxa o gate: falha em rota propria continua reprovando.
+( : > "$LOG_FILE" )
+PUBLIC_CHECKS='gamehunter.com.br:/api/health gamehunter.com.br:/jogo/red-dead-redemption-2'
+FAIL_API=true
+if candidate_direct_readiness_ok; then
+  echo 'backend /api failure was swallowed by candidate direct readiness'
+  exit 1
+fi
+FAIL_API=false
+
+# 4. O filtro e do backend: no frontend a pagina e rota propria e tem de rodar.
+SERVICE=frontend
+${readinessFunction}
+( : > "$LOG_FILE" )
+PUBLIC_CHECKS='gamehunter.com.br:/jogo/red-dead-redemption-2'
+candidate_direct_readiness_ok
 grep -q '/jogo/red-dead-redemption-2' "$LOG_FILE"
 `;
 
@@ -1364,14 +1402,14 @@ grep -q '/jogo/red-dead-redemption-2' "$LOG_FILE"
     assert.equal(
       result.status,
       0,
-      `candidate direct readiness fixture failed:\n${result.stdout}${result.stderr}`,
+      `candidate direct readiness fixture failed:
+${result.stdout}${result.stderr}`,
     );
   } finally {
     rmSync(fixtureDir, { force: true, recursive: true });
   }
   return true;
 }
-
 /** Exercita o helper real, extraido do workflow, contra um docker falso. */
 function runComposeRecreateRetryFixture(workflow) {
   if (!posixShellFixturesAvailable) return false;
@@ -1651,6 +1689,6 @@ console.log(
 );
 console.log(
   candidateDirectReadinessFixtureRan
-    ? 'backend candidate direct page readiness fixture PASS'
-    : 'backend candidate direct page readiness fixture SKIP (requires POSIX shell)',
+    ? 'candidate direct readiness service-scope fixture PASS'
+    : 'candidate direct readiness service-scope fixture SKIP (requires POSIX shell)',
 );
