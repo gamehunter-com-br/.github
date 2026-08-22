@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -21,6 +22,8 @@ const envHardeningStart = '# ENV_FILE_HARDENING_START';
 const envHardeningEnd = '# ENV_FILE_HARDENING_END';
 const protectedFlowStart = '# PROTECTED_RELEASE_FLOW_START';
 const protectedFlowEnd = '# PROTECTED_RELEASE_FLOW_END';
+const migrationDecisionStart = '# MIGRATION_DECISION_START';
+const migrationDecisionEnd = '# MIGRATION_DECISION_END';
 const posixShellFixturesAvailable = process.platform !== 'win32' ||
   process.env.GAMEHUNTER_FORCE_POSIX_FIXTURES === '1';
 
@@ -122,6 +125,183 @@ function assertWorkflowKeepsGuardBeforeRecreate() {
     'nginx backups must not be written under sites-enabled because nginx includes backup files',
   );
   assert.match(workflow, /rollback_service/);
+}
+
+function extractMigrationDecisionBlock(workflow) {
+  const start = workflow.indexOf(migrationDecisionStart);
+  const end = workflow.indexOf(migrationDecisionEnd, start);
+  assert.ok(start > -1, 'deploy workflow must contain the migration decision start marker');
+  assert.ok(end > start, 'deploy workflow must contain the migration decision end marker');
+  return workflow
+    .slice(start, end + migrationDecisionEnd.length)
+    .replace(/\r\n/g, '\n')
+    .replace(/\\\$/g, () => '$');
+}
+
+function assertSequentialMigrationContract() {
+  const workflow = readFileSync(deployWorkflowPath, 'utf8');
+
+  assert.match(
+    workflow,
+    /migration-policy:\s+[\s\S]*?default: always\s+[\s\S]*?type: string/,
+  );
+  assert.match(
+    workflow,
+    /migration-paths:\s+[\s\S]*?default: ''\s+[\s\S]*?type: string/,
+  );
+  assert.ok(workflow.includes('MIGRATION_POLICY: ${{ inputs.migration-policy }}'));
+  assert.ok(workflow.includes('MIGRATION_PATHS: ${{ inputs.migration-paths }}'));
+
+  const decisionBlock = extractMigrationDecisionBlock(workflow);
+  assert.match(decisionBlock, /org\.opencontainers\.image\.revision/);
+  assert.match(decisionBlock, /git diff --quiet/);
+  assert.match(decisionBlock, /echo run/);
+  assert.match(decisionBlock, /echo skip/);
+
+  const standardFlow = workflow.slice(workflow.lastIndexOf('            if [ "$CUTOVER_MODE" = "standard" ]; then'));
+  const decision = standardFlow.indexOf('resolve_migration_decision');
+  const migrate = standardFlow.indexOf('docker compose run', decision);
+  const handoff = standardFlow.indexOf('prepare_public_handoff', migrate);
+  const recreate = standardFlow.indexOf('compose_up_recreate', handoff);
+  assert.ok(decision > -1 && migrate > decision, 'migration must be controlled by the decision');
+  assert.ok(handoff > migrate && recreate > handoff, 'candidate handoff must still precede recreate');
+}
+
+function runSequentialMigrationDecisionFixture(workflow) {
+  if (!posixShellFixturesAvailable) return false;
+
+  const decisionBlock = extractMigrationDecisionBlock(workflow);
+  const fixtureDir = mkdtempSync(resolve(tmpdir(), 'gh-sequential-migration-'));
+  const fixturePath = resolve(fixtureDir, 'fixture.sh');
+  const repoDir = resolve(fixtureDir, 'repo');
+  mkdirSync(repoDir);
+
+  const git = (...args) => {
+    const result = spawnSync('git', args, { cwd: repoDir, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+
+  try {
+    git('init', '-q');
+    git('config', 'user.email', 'fixture@gamehunter.test');
+    git('config', 'user.name', 'GameHunter fixture');
+    writeFileSync(resolve(repoDir, 'migration.sql'), 'baseline\n');
+    writeFileSync(resolve(repoDir, 'app.js'), 'release-a\n');
+    git('add', '.');
+    git('commit', '-qm', 'release a');
+    const releaseA = git('rev-parse', 'HEAD');
+
+    writeFileSync(resolve(repoDir, 'migration.sql'), 'baseline\nschema-b\n');
+    git('commit', '-qam', 'release b schema');
+    const releaseB = git('rev-parse', 'HEAD');
+
+    writeFileSync(resolve(repoDir, 'app.js'), 'release-c app only\n');
+    git('commit', '-qam', 'release c app only');
+    const releaseC = git('rev-parse', 'HEAD');
+
+    const script = `#!/usr/bin/env bash
+set -euo pipefail
+cd "${repoDir}"
+MIGRATION_CMD='npm run migrate'
+MIGRATION_POLICY='changed-paths'
+MIGRATION_PATHS='migration.sql'
+CURRENT_REVISION='${releaseA}'
+CANDIDATE_REVISION='${releaseB}'
+docker() {
+  local ref="\${@: -1}"
+  case "$ref" in
+    current-image) printf '%s\\n' "$CURRENT_REVISION" ;;
+    candidate-image) printf '%s\\n' "$CANDIDATE_REVISION" ;;
+    *) return 1 ;;
+  esac
+}
+${decisionBlock}
+
+CANONICAL_HEALTHY=true
+CANDIDATE_HEALTHY=false
+CANONICAL_UPSTREAM=true
+CANDIDATE_UPSTREAM=false
+HEALTH_PROBES=0
+
+probe_effective_backend() {
+  HEALTH_PROBES=$((HEALTH_PROBES + 1))
+  if [ "$CANONICAL_UPSTREAM" = true ] && [ "$CANONICAL_HEALTHY" = true ]; then
+    return 0
+  fi
+  [ "$CANDIDATE_UPSTREAM" = true ] && [ "$CANDIDATE_HEALTHY" = true ]
+}
+
+apply_migration_effect() {
+  local decision="$1"
+  [ "$decision" = run ] || return 0
+
+  # Reexecutar o catalogo de DDL sem mudanca de schema reproduz a classe do
+  # incidente: lock enfileirado tira as leituras do backend vigente de health.
+  if git diff --quiet "$CURRENT_REVISION" "$CANDIDATE_REVISION" -- migration.sql; then
+    CANONICAL_HEALTHY=false
+  fi
+}
+
+deploy_release() {
+  local decision
+  probe_effective_backend
+  decision="$(resolve_migration_decision current-image candidate-image)"
+  apply_migration_effect "$decision"
+  probe_effective_backend
+
+  # O candidato entra no upstream antes do gap do recreate canonico.
+  CANDIDATE_HEALTHY=true
+  CANDIDATE_UPSTREAM=true
+  probe_effective_backend
+  CANONICAL_HEALTHY=false
+  probe_effective_backend
+
+  CANONICAL_HEALTHY=true
+  CANDIDATE_UPSTREAM=false
+  CANDIDATE_HEALTHY=false
+  CURRENT_REVISION="$CANDIDATE_REVISION"
+  probe_effective_backend
+}
+
+# Primeiro release altera schema: migra. O segundo e app-only: nao repete DDL.
+# As cinco fases observadas de cada cutover mantem ao menos um upstream efetivo.
+deploy_release
+
+CANDIDATE_REVISION='${releaseC}'
+deploy_release
+[ "$HEALTH_PROBES" -eq 10 ]
+
+# O fixture precisa detectar o comportamento antigo, nao apenas passar no novo:
+# policy=always no segundo release repete DDL e derruba o unico upstream vigente
+# antes de o candidato existir.
+CURRENT_REVISION='${releaseB}'
+CANDIDATE_REVISION='${releaseC}'
+CANONICAL_HEALTHY=true
+MIGRATION_POLICY=always
+decision="$(resolve_migration_decision current-image candidate-image)"
+[ "$decision" = run ]
+apply_migration_effect "$decision"
+if probe_effective_backend; then
+  echo 'legacy always policy should expose an unhealthy effective backend'
+  exit 1
+fi
+
+# Sem identidade comparavel, falha fechado executando a migration.
+MIGRATION_POLICY=changed-paths
+[ "$(resolve_migration_decision '' candidate-image)" = run ]
+`;
+    writeFileSync(fixturePath, script, { mode: 0o700 });
+    const result = spawnSync('bash', [fixturePath], { cwd: repoDir, encoding: 'utf8' });
+    assert.equal(
+      result.status,
+      0,
+      `sequential migration decision fixture failed:\n${result.stdout}${result.stderr}`,
+    );
+  } finally {
+    rmSync(fixtureDir, { force: true, recursive: true });
+  }
+  return true;
 }
 
 function countOccurrences(value, search) {
@@ -811,6 +991,7 @@ function runProtectedFlowFixture(workflow) {
   if (!posixShellFixturesAvailable) return false;
 
   const protectedBlock = extractProtectedFlowBlock(workflow);
+  const migrationDecisionBlock = extractMigrationDecisionBlock(workflow);
   const fixtureDir = mkdtempSync(resolve(tmpdir(), 'gh-protected-flow-'));
   const fixturePath = resolve(fixtureDir, 'fixture.sh');
   const script = `#!/usr/bin/env bash
@@ -835,6 +1016,9 @@ ALL_SERVICES='backend workers'
 DEPLOY_WORKERS=true
 WORKER_DRAIN_ENABLED=true
 MIGRATION_CMD='npm run migrate'
+MIGRATION_POLICY='changed-paths'
+MIGRATION_PATHS='migration.sql'
+CURRENT='current-image'
 DEFAULT_PORT=3001
 HEALTH_PATH=/health
 PROTECTED_BOUNDED_SECONDS=0
@@ -919,6 +1103,7 @@ docker() {
     fi
   fi
 }
+${migrationDecisionBlock}
 resolve_release_identity() { record "RESOLVE $*"; }
 update_image_tag_env() { record "UPDATE $*"; }
 assert_running_release_identity() {
@@ -1638,6 +1823,7 @@ assert.equal(rollback.afterRollback.ok, true);
 assert.equal(rollback.afterRollback.servedBy, 'canonical-rollback');
 
 assertWorkflowKeepsGuardBeforeRecreate();
+assertSequentialMigrationContract();
 assertEveryRecreateGoesThroughRetry();
 assertDeployHeredocAndRollbackImageAreUnambiguous();
 assertRollbackTagIsValidatedBeforeSsh();
@@ -1658,6 +1844,7 @@ const protectedFixtureRan = runProtectedFlowFixture(deployEnv.workflow);
 const composeRetryFixtureRan = runComposeRecreateRetryFixture(deployEnv.workflow);
 const currentImageFixtureRan = runCurrentServiceImageFixture(deployEnv.workflow);
 const candidateDirectReadinessFixtureRan = runCandidateDirectReadinessFixture(deployEnv.workflow);
+const sequentialMigrationFixtureRan = runSequentialMigrationDecisionFixture(deployEnv.workflow);
 
 console.log('deploy handoff readiness fixture PASS');
 console.log('deploy/rollback env hardening structural fixture PASS');
@@ -1691,4 +1878,9 @@ console.log(
   candidateDirectReadinessFixtureRan
     ? 'candidate direct readiness service-scope fixture PASS'
     : 'candidate direct readiness service-scope fixture SKIP (requires POSIX shell)',
+);
+console.log(
+  sequentialMigrationFixtureRan
+    ? 'sequential deploy migration decision fixture PASS'
+    : 'sequential deploy migration decision fixture SKIP (requires POSIX shell)',
 );
