@@ -858,10 +858,27 @@ jobs:
               for check in \$PUBLIC_CHECKS; do
                 host="\${check%%:*}"
                 path="\${check#*:}"
-                # Toda rota declarada pelo caller precisa passar no candidato
-                # isolado. Pular paginas do backend deixa o gate publico medir
-                # um pool misto e permite que a versao canonica velha decida o
-                # resultado do deploy da correcao.
+                # Este gate curla o candidato DIRETO (127.0.0.1 na porta do candidato),
+                # sem passar pelo nginx -- entao so pode validar path que o PROPRIO
+                # servico serve. O caller declara em public-readiness-checks a matriz
+                # do SITE (que inclui paginas do Next) porque a mesma matriz alimenta
+                # o gate publico pos-cutover, esse sim via nginx, com roteamento.
+                #
+                # Sem este filtro o deploy do backend curla /jogo,
+                # /calendario-lancamentos e /empresas contra um container de BACKEND,
+                # que nao tem essas rotas: 404 constante, 90s de espera e
+                # "FAIL: candidate direct readiness failed" em 100% dos deploys.
+                # Foi o que .github#37 causou (run 32571431839 / GAM-552, GAM-553).
+                #
+                # Validar pagina do frontend no candidato do backend so faria sentido
+                # se o backend passasse a servir essas rotas: decisao de arquitetura,
+                # nao ajuste de CI. Enquanto nao for, pagina fica com o gate publico.
+                if [ "$SERVICE" = "backend" ]; then
+                  case "\$path" in
+                    /api/*|/health) ;;
+                    *) continue ;;
+                  esac
+                fi
                 checked=1
                 curl -fsS --connect-timeout 2 --max-time 8 \
                   -H "Host: \$host" \
