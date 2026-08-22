@@ -98,6 +98,16 @@ on:
         required: false
         default: ''
         type: string
+      migration-policy:
+        description: 'always executa em todo deploy; changed-paths executa apenas quando fontes de schema mudaram desde a imagem efetiva'
+        required: false
+        default: always
+        type: string
+      migration-paths:
+        description: 'Pathspecs separados por espaco usados por changed-paths'
+        required: false
+        default: ''
+        type: string
       purge-cf:
         description: 'Purgar CF cache full pos deploy ok'
         required: false
@@ -332,9 +342,30 @@ jobs:
           PROTECTED_CANARY_OPERATOR: ${{ steps.tag.outputs.canary_operator }}
           DEPLOY_RUN_ID: ${{ github.run_id }}
           MIGRATION_CMD: ${{ inputs.migration-cmd }}
+          MIGRATION_POLICY: ${{ inputs.migration-policy }}
+          MIGRATION_PATHS: ${{ inputs.migration-paths }}
           GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
           GH_OWNER: ${{ github.repository_owner }}
         run: |
+          set -euo pipefail
+          case "$MIGRATION_POLICY" in
+            always|changed-paths) ;;
+            *)
+              echo "::error::migration-policy deve ser always ou changed-paths"
+              exit 1
+              ;;
+          esac
+          if [ "$MIGRATION_POLICY" = "changed-paths" ] && [ -n "$MIGRATION_CMD" ]; then
+            if [ -z "$MIGRATION_PATHS" ]; then
+              echo "::error::changed-paths exige migration-paths"
+              exit 1
+            fi
+            if [[ ! "$MIGRATION_PATHS" =~ ^[A-Za-z0-9_./\ -]+$ ]]; then
+              echo "::error::migration-paths contem caracteres invalidos"
+              exit 1
+            fi
+          fi
+
           # Heredoc SEM quote no marker => expansao LOCAL acontece, escapes \$ ficam literal
           ssh \
             -o StrictHostKeyChecking=accept-new \
@@ -346,6 +377,8 @@ jobs:
             -i ~/.ssh/deploy_key \
             "$VPS_USER@$VPS_HOST" 'bash -euo pipefail -s' << EOF
             cd "$VPS_PATH"
+            MIGRATION_POLICY="$MIGRATION_POLICY"
+            MIGRATION_PATHS="$MIGRATION_PATHS"
 
             # ENV_FILE_HARDENING_START
             # .env contem segredos de runtime. O workflow troca apenas IMAGE_TAG,
@@ -578,6 +611,60 @@ jobs:
               printf '%s\n' "\$current_image_id"
             }
 
+            # MIGRATION_DECISION_START
+            # Skip is allowed only when both immutable image revisions are
+            # provable and their diff does not touch a caller-owned schema path.
+            # Any missing identity/history fails closed by running the migration.
+            resolve_migration_decision() {
+              local candidate_image="\$2"
+              local candidate_revision current_image="\$1" current_revision diff_status
+
+              if [ "\$MIGRATION_POLICY" = "always" ]; then
+                echo run
+                return 0
+              fi
+              if [ -z "\$current_image" ]; then
+                echo "Migration decision: no effective image; running migration" >&2
+                echo run
+                return 0
+              fi
+
+              current_revision=\$(docker image inspect \
+                --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+                "\$current_image" 2>/dev/null) || current_revision=""
+              candidate_revision=\$(docker image inspect \
+                --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+                "\$candidate_image" 2>/dev/null) || candidate_revision=""
+              current_revision="\${current_revision,,}"
+              candidate_revision="\${candidate_revision,,}"
+
+              if [[ ! "\$current_revision" =~ ^[0-9a-f]{40}$ ]] \
+                || [[ ! "\$candidate_revision" =~ ^[0-9a-f]{40}$ ]] \
+                || ! git cat-file -e "\$current_revision^{commit}" 2>/dev/null \
+                || ! git cat-file -e "\$candidate_revision^{commit}" 2>/dev/null; then
+                echo "Migration decision: image revisions are not comparable; running migration" >&2
+                echo run
+                return 0
+              fi
+
+              diff_status=0
+              git diff --quiet "\$current_revision" "\$candidate_revision" -- \$MIGRATION_PATHS \
+                || diff_status=\$?
+              if [ "\$diff_status" -eq 0 ]; then
+                echo "Migration decision: schema sources unchanged; skipping migration" >&2
+                echo skip
+                return 0
+              fi
+              if [ "\$diff_status" -eq 1 ]; then
+                echo "Migration decision: schema sources changed; running migration" >&2
+                echo run
+                return 0
+              fi
+              echo "FAIL: could not compare migration sources" >&2
+              return "\$diff_status"
+            }
+            # MIGRATION_DECISION_END
+
             trap 'status=\$?; cleanup_env_tmp; exit \$status' EXIT
 
             git fetch origin main
@@ -585,10 +672,9 @@ jobs:
 
             echo "$GHCR_PULL_TOKEN" | docker login ghcr.io -u "$GH_OWNER" --password-stdin
 
-            CURRENT=""
+            CURRENT=\$(resolve_current_service_image_id "$SERVICE") || exit 1
             ROLLBACK_RELEASE_TAG=""
             if [ "$CUTOVER_MODE" = "standard" ]; then
-              CURRENT=\$(resolve_current_service_image_id "$SERVICE") || exit 1
               if [ "$RELEASE_IDENTITY_ENABLED" = "true" ]; then
                 if [ ! -f .env ] || [ -L .env ]; then
                   echo "FAIL: .env must be a regular non-symlink file"
@@ -638,7 +724,14 @@ jobs:
               fi
 
               if [ -n "$MIGRATION_CMD" ]; then
-                docker compose run -T --rm --no-deps "$SERVICE" $MIGRATION_CMD < /dev/null
+                MIGRATION_DECISION=\$(resolve_migration_decision "\$CURRENT" "$IMAGE:$TAG")
+                case "\$MIGRATION_DECISION" in
+                  run)
+                    docker compose run -T --rm --no-deps "$SERVICE" $MIGRATION_CMD < /dev/null
+                    ;;
+                  skip) ;;
+                  *) echo "FAIL: invalid migration decision"; exit 1 ;;
+                esac
               fi
             fi
 
@@ -1482,8 +1575,16 @@ jobs:
                     "$TAG" "$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" \
                     false disabled false || return 1
                   if [ -n "$MIGRATION_CMD" ]; then
-                    docker compose run -T --rm --no-deps "$SERVICE" \
-                      $MIGRATION_CMD < /dev/null || return 1
+                    MIGRATION_DECISION=\$(resolve_migration_decision "\$CURRENT" "$IMAGE:$TAG") \
+                      || return 1
+                    case "\$MIGRATION_DECISION" in
+                      run)
+                        docker compose run -T --rm --no-deps "$SERVICE" \
+                          $MIGRATION_CMD < /dev/null || return 1
+                        ;;
+                      skip) ;;
+                      *) echo "FAIL: invalid migration decision"; return 1 ;;
+                    esac
                   fi
                   compose_up_recreate || return 1
                   assert_running_release_identity \
