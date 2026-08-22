@@ -49,23 +49,48 @@ jobs:
       RELEASE_TAG_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
 ```
 
-> ⚠️ **Note:** This reusable creates the tag but does NOT bump `package.json`
-> version. Bump it manually on a PR before triggering promote-release, or
-> the next `npm publish` will fail with E409 conflict.
+> ⚠️ **Note:** este reusable cria a tag mas **não** commita o bump do
+> `package.json`. Desde `v1.4.9` isso não quebra mais o publish: o
+> `publish-package.yml` deriva a versão da tag, não do `package.json`.
+> Commitar o bump continua sendo boa higiene (deixa o repo legível), mas
+> deixou de ser pré-requisito.
+>
+> A versão anterior desta nota dizia que sem o bump manual o `npm publish`
+> falharia com **E409**. Estava errado, e o erro custou caro: o publish achava
+> a versão antiga já publicada, emitia `already exists; skipping` e terminava
+> **VERDE sem publicar nada**. Como a doc prometia falha barulhenta, ninguém
+> procurou a silenciosa — foram 57 tags fantasma (33 em `scrapers`, 21 em
+> `contracts`, 3 em `integrations`) até 06/08/2026.
 
 ### `.github/workflows/publish-package.yml`
 
 Publica package npm no GitHub Packages quando tag `vX.Y.Z` é pushada.
+
+**A tag é a fonte única de verdade da versão** (desde `v1.4.9`):
+
+- A versão publicada vem de `${GITHUB_REF_NAME#v}`. Uma tag que não seja
+  `vX.Y.Z` estrito falha em vez de adivinhar.
+- Se o `package.json` divergir, `npm version --no-git-tag-version` o alinha à
+  tag depois do `npm ci` e antes do build, pro artefato publicado carregar a
+  versão que a tag nomeia.
+- Se a versão pedida pela tag **já existe** no registry e o `package.json`
+  aponta pra outra, o job **falha**: ele não publicaria nada e ficaria verde,
+  deixando tag fantasma. Re-run de release já publicado (tag ==
+  `package.json` == publicada) segue idempotente e verde.
 
 **Inputs:**
 - `node-version` (string, default `'22'`)
 - `runner` (string, default `blacksmith-4vcpu-ubuntu-2404`)
 - `build-command` (string, default `npm run build`)
 - `publish-command` (string, default `npm publish`)
-- `needs-cross-repo-deps` (boolean, default `false`) — set `true` se package depende de outros `@gamehunter-com-br/*` (usa `NPM_PACKAGES_READ_TOKEN` em `npm ci`).
+- `needs-cross-repo-deps` (boolean, default `false`) — set `true` se o package
+  depende de outros `@gamehunter-com-br/*`; o `npm ci` usa o secret opcional e
+  faz fallback para o `GITHUB_TOKEN` do caller.
 
 **Secrets:**
-- `NPM_PACKAGES_READ_TOKEN` (opcional) — required quando `needs-cross-repo-deps=true`.
+- `NPM_PACKAGES_READ_TOKEN` (opcional) — usado quando presente; caso contrário,
+  o install usa o `GITHUB_TOKEN` do caller. O repositório consumidor precisa de
+  acesso de leitura ao package em **Manage Actions access** para esse fallback.
 
 **Stub no consumer (~17 LoC):**
 
@@ -115,11 +140,34 @@ Deploya uma imagem GHCR no VPS via Docker Compose.
 - `worker-drain-enabled` (string, default `'true'`) - quando `true` e `workers` esta na lista efetiva, roda
   `npm run deploy:workers:drain` antes do restart.
 - `worker-drain-timeout-minutes` (string, default `'15'`) - timeout do drain.
+- `release-identity-enabled` (boolean, default `false`) - depois do pull, valida os labels OCI e o repo digest
+  da imagem e persiste atomicamente `GH_RELEASE_TAG`, `GH_GIT_SHA` e `GH_IMAGE_DIGEST` no `.env`, junto de
+  `IMAGE_TAG`. O deploy falha fechado se qualquer parte da tupla estiver ausente ou malformada. Use somente em
+  runtimes que consomem a identidade da release; o rollback reutiliza a mesma validação.
+- `public-readiness-checks` (string, default `''`) - F1-175: lista separada por espaco de `host:/path`
+  validada no VPS via nginx local (`curl --resolve host:443:127.0.0.1`) depois do health local e antes de
+  declarar deploy saudavel. Vazio usa defaults por service: backend valida
+  `gamehunter.com.br:/api/health` e `gamehunter.com.br:/api/rpc/health`; frontend valida
+  `gamehunter.com.br:/`; admin valida `admin.gamehunter.com.br:/`. Use `none` apenas quando o service nao tem
+  rota publica por nginx.
+- `public-readiness-timeout-seconds` (string, default `'90'`) - tempo maximo do gate publico/nginx. Falha aciona
+  o rollback ja existente do reusable.
 
 O drain roda depois da migration do backend, usando a nova imagem ja pullada, e antes de `docker compose up` recriar
 `workers`. Em sucesso de health, o workflow chama `npm run deploy:workers:resume`; em rollback/falha, o trap tenta
 retomar a fila em best-effort. Exit codes do drain: `0` libera, `20` bloqueia por politica, `21` timeout, `22` estado
 inseguro e `1` erro tecnico.
+
+Para `backend` e `frontend`, o reusable agora protege o handoff de porta fixa antes de recriar o container canonico.
+Ele sobe um candidato temporario em porta local alternativa, valida health e checks publicos do proprio servico, adiciona
+essa porta ao upstream nginx como fallback, e so entao executa `docker compose up --force-recreate` na porta canonica.
+Depois que a porta canonica nova passa, o candidato e removido do upstream e parado. Em falha, o rollback recria a tag
+anterior enquanto o candidato continua protegendo o upstream publico. Readiness pos-restart sozinho nao e considerado
+traffic-safe para servicos atras de nginx em porta fixa.
+
+Depois do `docker compose up`, o reusable nao encerra apenas com o health local do container. O gate F1-175 tambem prova
+que o nginx local consegue servir as rotas publicas configuradas sem `connect() failed`/upstream indisponivel. Isso evita
+declarar deploy verde enquanto Cloudflare ou o usuario ainda receberiam 502/504 por upstream recusado no edge/origem.
 
 Use override `deploy-workers=true` quando a release docs/API-only ainda precisa reiniciar workers por operacao manual.
 Use `deploy-workers=false` quando a mudanca de backend nao toca runtime dos workers e o diff automatico for

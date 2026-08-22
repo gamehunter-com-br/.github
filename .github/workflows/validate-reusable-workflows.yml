@@ -1,0 +1,59 @@
+name: Validate reusable workflows
+
+on:
+  pull_request:
+    # Sem filtro de paths: este job e REQUIRED CHECK na main desde 21/08/2026. Com filtro, um PR
+    # que nao toca os paths listados nunca dispara o check e fica BLOCKED para sempre — a licao do
+    # PR #1605, ja aplicada no ci.yml dos 4 apps e no spec-lint.yml do gamehunter-specs. O job e
+    # deterministic (actionlint sobre glob + dois scripts node, sem olhar arquivo alterado) e roda
+    # em runner hospedado, entao rodar sempre custa ~1 min e nao toca o pool da E1.
+    #
+    # O filtro continua no push, onde nao ha check para travar.
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/**'
+      - 'scripts/test-deploy-handoff-readiness.mjs'
+
+permissions:
+  contents: read
+
+jobs:
+  structural-fixtures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned actionlint
+        env:
+          ACTIONLINT_VERSION: '1.7.12'
+          ACTIONLINT_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl -fsSLo "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          chmod 0755 "$RUNNER_TEMP/actionlint"
+      - name: Lint reusable workflows
+        run: |
+          # Shell semantics are covered by the dedicated fixture below. Keep this
+          # gate deterministic across runner images by disabling optional tools.
+          #
+          # Glob instead of an explicit list: the list had drifted and covered only
+          # 4 of the 7 workflows here. The three that were missing included
+          # ci-pipeline.yml — the single file that governs CI for all four apps —
+          # so an expression typo in the most load-bearing workflow of the org was
+          # not being caught. A glob cannot drift when a workflow is added.
+          "$RUNNER_TEMP/actionlint" -no-color -shellcheck="" -pyflakes="" \
+            .github/workflows/*.yml
+      - name: Validate deploy and rollback invariants
+        run: node scripts/test-deploy-handoff-readiness.mjs
+
+      # Guarda a mensagem, nao so o comportamento: o promote-release precisa
+      # dizer QUAL coisa quebrou. Em 20/08/2026 ele culpou a ancestralidade do
+      # commit quando o problema era o RELEASE_TAG_TOKEN.
+      - name: Validate promote-release failure messages
+        run: node scripts/test-promote-release-messages.mjs
