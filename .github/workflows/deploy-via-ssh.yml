@@ -1640,14 +1640,35 @@ jobs:
               local tmp backup
               tmp=\$(mktemp)
               backup=\$(make_handoff_nginx_backup "remove")
-              grep -v "\$HANDOFF_MARKER" "\$HANDOFF_NGINX_SITE" > "\$tmp"
+              if ! awk -v marker="\$HANDOFF_MARKER" '
+                {
+                  canonical_prefix = "# " marker "-canonical "
+                  canonical_pos = index(\$0, canonical_prefix)
+                  if (canonical_pos > 0) {
+                    print substr(\$0, canonical_pos + length(canonical_prefix))
+                    restored++
+                    next
+                  }
+                  if (index(\$0, marker) > 0) {
+                    removed++
+                    next
+                  }
+                  print
+                }
+                END { if (restored != 1 || removed != 1) exit 42 }
+              ' "\$HANDOFF_NGINX_SITE" > "\$tmp"; then
+                echo "FAIL: candidate-only nginx marker is incomplete; refusing partial restore"
+                rm -f "\$tmp" "\$backup"
+                return 1
+              fi
               mv "\$tmp" "\$HANDOFF_NGINX_SITE"
               if nginx -t; then
                 nginx -s reload
                 rm -f "\$backup"
-                echo "Removed temporary nginx candidate upstream"
+                echo "Restored canonical-only nginx upstream"
+                HANDOFF_MARKER=""
               else
-                echo "FAIL: nginx config invalid after candidate removal; restoring backup"
+                echo "FAIL: nginx config invalid after canonical restore; restoring candidate-only backup"
                 mv "\$backup" "\$HANDOFF_NGINX_SITE"
                 nginx -t
                 nginx -s reload
@@ -1675,7 +1696,7 @@ jobs:
               echo "\$backup"
             }
 
-            add_handoff_candidate_upstream() {
+            activate_handoff_candidate_only_upstream() {
               local upstream_name="\$1"
               local canonical_port="\$2"
               local candidate_port="\$3"
@@ -1687,30 +1708,34 @@ jobs:
               fi
 
               tmp=\$(mktemp)
-              awk -v upstream="upstream \$upstream_name" \
+              if ! awk -v upstream="upstream \$upstream_name" \
                 -v canonical_port="\$canonical_port" \
                 -v candidate_port="\$candidate_port" \
                 -v marker="\$HANDOFF_MARKER" '
                 \$0 ~ "^[[:space:]]*" upstream "[[:space:]]*\\\\{" { in_block=1 }
-                in_block && \$0 ~ "server 127\\\\.0\\\\.0\\\\.1:" canonical_port "[[:space:]]" && inserted == 0 {
-                  print
+                in_block && \$0 ~ "server 127\\\\.0\\\\.0\\\\.1:" canonical_port "[[:space:]]" && replaced == 0 {
+                  print "    # " marker "-canonical " \$0
                   print "    server 127.0.0.1:" candidate_port " max_fails=0; # " marker
-                  inserted=1
+                  replaced=1
                   next
                 }
                 in_block && \$0 ~ "^[[:space:]]*\\\\}" { in_block=0 }
                 { print }
-                END { if (inserted != 1) exit 42 }
-              ' "\$HANDOFF_NGINX_SITE" > "\$tmp"
+                END { if (replaced != 1) exit 42 }
+              ' "\$HANDOFF_NGINX_SITE" > "\$tmp"; then
+                echo "FAIL: canonical nginx upstream not found; refusing candidate-only cutover"
+                rm -f "\$tmp"
+                return 1
+              fi
 
-              backup=\$(make_handoff_nginx_backup "add")
+              backup=\$(make_handoff_nginx_backup "candidate-only")
               mv "\$tmp" "\$HANDOFF_NGINX_SITE"
               if nginx -t; then
                 nginx -s reload
                 rm -f "\$backup"
-                echo "Added temporary nginx candidate upstream 127.0.0.1:\$candidate_port to \$upstream_name"
+                echo "Activated candidate-only nginx upstream 127.0.0.1:\$candidate_port for \$upstream_name"
               else
-                echo "FAIL: nginx config invalid with candidate upstream; restoring backup"
+                echo "FAIL: nginx config invalid with candidate-only upstream; restoring canonical backup"
                 mv "\$backup" "\$HANDOFF_NGINX_SITE"
                 nginx -t
                 nginx -s reload
@@ -1762,8 +1787,8 @@ jobs:
                 return 1
               fi
 
-              add_handoff_candidate_upstream "\$upstream_name" "$DEFAULT_PORT" "\$HANDOFF_CANDIDATE_PORT"
-              wait_public_readiness "candidate pool"
+              activate_handoff_candidate_only_upstream "\$upstream_name" "$DEFAULT_PORT" "\$HANDOFF_CANDIDATE_PORT"
+              wait_public_readiness "candidate-only upstream"
             }
 
             rollback_service() {
@@ -1821,16 +1846,16 @@ jobs:
               rollback_service "canonical health failed after 60s"
             fi
 
-            if ! wait_public_readiness "candidate pool"; then
-              rollback_service "public readiness failed while candidate protected the upstream"
+            if ! wait_public_readiness "candidate-only upstream after canonical recreate"; then
+              rollback_service "public readiness failed while candidate exclusively protected the upstream"
             fi
 
             remove_handoff_candidate_upstream
-            if ! wait_public_readiness "canonical upstream"; then
+            if ! wait_public_readiness "canonical-only upstream"; then
               if [ -n "\$HANDOFF_CANDIDATE_PORT" ]; then
-                add_handoff_candidate_upstream "gamehunter_$SERVICE" "$DEFAULT_PORT" "\$HANDOFF_CANDIDATE_PORT" || true
+                activate_handoff_candidate_only_upstream "gamehunter_$SERVICE" "$DEFAULT_PORT" "\$HANDOFF_CANDIDATE_PORT" || true
               fi
-              rollback_service "canonical public readiness failed after candidate removal"
+              rollback_service "canonical-only public readiness failed after candidate handoff"
             fi
 
             stop_handoff_candidate

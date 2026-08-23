@@ -40,6 +40,10 @@ class UpstreamPool {
     this.servers = this.servers.filter((server) => server.name !== name);
   }
 
+  replace(server) {
+    this.servers = [server];
+  }
+
   request() {
     const errors = [];
     for (const server of this.servers) {
@@ -71,7 +75,7 @@ function simulateCandidateProtectedRecreate() {
   const candidate = { name: 'candidate-new', alive: true };
   const pool = new UpstreamPool(canonical);
 
-  pool.add(candidate);
+  pool.replace(candidate);
   canonical.alive = false;
   const duringCanonicalGap = pool.request();
 
@@ -79,7 +83,7 @@ function simulateCandidateProtectedRecreate() {
   canonical.alive = true;
   const afterCanonicalStart = pool.request();
 
-  pool.remove(candidate.name);
+  pool.replace(canonical);
   const finalCanonicalOnly = pool.request();
 
   return { duringCanonicalGap, afterCanonicalStart, finalCanonicalOnly };
@@ -88,14 +92,14 @@ function simulateCandidateProtectedRecreate() {
 function simulateRollbackWhileCandidateProtectsTraffic() {
   const canonical = { name: 'canonical-old', alive: true };
   const candidate = { name: 'candidate-new', alive: true };
-  const pool = new UpstreamPool(canonical, candidate);
+  const pool = new UpstreamPool(candidate);
 
   canonical.alive = false;
   const duringFailedDeploy = pool.request();
 
   canonical.name = 'canonical-rollback';
   canonical.alive = true;
-  pool.remove(candidate.name);
+  pool.replace(canonical);
   const afterRollback = pool.request();
 
   return { duringFailedDeploy, afterRollback };
@@ -125,6 +129,16 @@ function assertWorkflowKeepsGuardBeforeRecreate() {
     'nginx backups must not be written under sites-enabled because nginx includes backup files',
   );
   assert.match(workflow, /rollback_service/);
+  assert.doesNotMatch(
+    workflow,
+    /wait_public_readiness "candidate pool"/,
+    'public readiness must never validate a mixed canonical/candidate upstream',
+  );
+  assert.match(
+    workflow,
+    /activate_handoff_candidate_only_upstream/,
+    'handoff must switch nginx to the candidate before the public gate',
+  );
 }
 
 function extractMigrationDecisionBlock(workflow) {
@@ -1501,6 +1515,89 @@ function extractCandidateDirectReadinessHelper(workflow) {
     .replace(/\\\$/g, () => '$');
 }
 
+function extractHandoffUpstreamHelpers(workflow) {
+  const removeStart = workflow.indexOf('            remove_handoff_candidate_upstream() {');
+  const removeEnd = workflow.indexOf('\n\n            stop_handoff_candidate()', removeStart);
+  const activateStart = workflow.indexOf('            activate_handoff_candidate_only_upstream() {');
+  const activateEnd = workflow.indexOf('\n\n            find_handoff_candidate_port()', activateStart);
+  assert.ok(removeStart > -1 && removeEnd > removeStart, 'canonical restore helper must be extractable');
+  assert.ok(
+    activateStart > -1 && activateEnd > activateStart,
+    'candidate-only activation helper must be extractable',
+  );
+  return [
+    workflow.slice(removeStart, removeEnd),
+    workflow.slice(activateStart, activateEnd),
+  ].map((source) => source
+    .replace(/^ {12}/gm, '')
+    .replace(/\\\$/g, () => '$')
+    // A funcao atravessa dois shells no workflow (runner -> SSH). A fixture
+    // executa so o shell remoto, portanto consome uma camada de escaping.
+    .replace(/\\\\\\\\/g, '\\\\'));
+}
+
+/** Prova que o gate publico nunca enxerga canonical e candidate ao mesmo tempo. */
+function runCandidateOnlyUpstreamFixture(workflow) {
+  if (!posixShellFixturesAvailable) return false;
+
+  const [removeFunction, activateFunction] = extractHandoffUpstreamHelpers(workflow);
+  const fixtureDir = mkdtempSync(resolve(tmpdir(), 'gh-candidate-only-upstream-'));
+  const fixturePath = resolve(fixtureDir, 'fixture.sh');
+  const nginxPath = resolve(fixtureDir, 'gamehunter');
+  const originalPath = resolve(fixtureDir, 'gamehunter.original');
+  const script = `#!/usr/bin/env bash
+set -euo pipefail
+SERVICE=backend
+DEPLOY_RUN_ID=433
+HANDOFF_MARKER=''
+HANDOFF_NGINX_SITE='${nginxPath}'
+HANDOFF_NGINX_BACKUP_DIR='${resolve(fixtureDir, 'backups')}'
+
+nginx() { return 0; }
+make_handoff_nginx_backup() {
+  mkdir -p "$HANDOFF_NGINX_BACKUP_DIR"
+  local backup="$HANDOFF_NGINX_BACKUP_DIR/$1.bak"
+  cp "$HANDOFF_NGINX_SITE" "$backup"
+  echo "$backup"
+}
+
+${removeFunction}
+${activateFunction}
+
+cat > "$HANDOFF_NGINX_SITE" <<'NGINX'
+upstream gamehunter_backend {
+    server 127.0.0.1:3001 max_fails=3 fail_timeout=10s;
+}
+NGINX
+cp "$HANDOFF_NGINX_SITE" '${originalPath}'
+
+activate_handoff_candidate_only_upstream gamehunter_backend 3001 13001
+[ "$(grep -c '^    server ' "$HANDOFF_NGINX_SITE")" = 1 ]
+grep -q '^    server 127.0.0.1:13001 max_fails=0; # gh-deploy-candidate:backend:433$' "$HANDOFF_NGINX_SITE"
+if grep -q '^    server 127.0.0.1:3001 ' "$HANDOFF_NGINX_SITE"; then
+  echo 'canonical remained active beside candidate'
+  exit 1
+fi
+
+remove_handoff_candidate_upstream
+cmp '${originalPath}' "$HANDOFF_NGINX_SITE"
+remove_handoff_candidate_upstream
+`;
+
+  try {
+    writeFileSync(fixturePath, script, { mode: 0o700 });
+    const result = spawnSync('bash', [fixturePath], { cwd: fixtureDir, encoding: 'utf8' });
+    assert.equal(
+      result.status,
+      0,
+      `candidate-only upstream fixture failed:\n${result.stdout}${result.stderr}`,
+    );
+  } finally {
+    rmSync(fixtureDir, { force: true, recursive: true });
+  }
+  return true;
+}
+
 /**
  * Prova o contrato do gate de readiness DIRETA no candidato: ele curla o
  * container do servico sem passar pelo nginx, entao so pode exercitar path
@@ -1844,6 +1941,7 @@ const protectedFixtureRan = runProtectedFlowFixture(deployEnv.workflow);
 const composeRetryFixtureRan = runComposeRecreateRetryFixture(deployEnv.workflow);
 const currentImageFixtureRan = runCurrentServiceImageFixture(deployEnv.workflow);
 const candidateDirectReadinessFixtureRan = runCandidateDirectReadinessFixture(deployEnv.workflow);
+const candidateOnlyUpstreamFixtureRan = runCandidateOnlyUpstreamFixture(deployEnv.workflow);
 const sequentialMigrationFixtureRan = runSequentialMigrationDecisionFixture(deployEnv.workflow);
 
 console.log('deploy handoff readiness fixture PASS');
@@ -1878,6 +1976,11 @@ console.log(
   candidateDirectReadinessFixtureRan
     ? 'candidate direct readiness service-scope fixture PASS'
     : 'candidate direct readiness service-scope fixture SKIP (requires POSIX shell)',
+);
+console.log(
+  candidateOnlyUpstreamFixtureRan
+    ? 'candidate-only public upstream fixture PASS'
+    : 'candidate-only public upstream fixture SKIP (requires POSIX shell)',
 );
 console.log(
   sequentialMigrationFixtureRan
