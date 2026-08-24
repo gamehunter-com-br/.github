@@ -545,6 +545,39 @@ function assertBuildOnlyIdentityContract() {
   assert.ok(workflow.includes('release-identity-${{ github.run_id }}'));
 }
 
+// Guarda a MENSAGEM do guard de avanco de tag, no mesmo espirito do
+// test-promote-release-messages.mjs: um guard que diagnostica certo e prescreve
+// errado vira o motor do incidente.
+//
+// Ate 24/08/2026 a mensagem dizia "Recrie a tag a partir da main". Quem recria
+// costuma reusar o MESMO SHA recusado — so o numero e recalculado —, entao o
+// conselho reproduzia o erro num numero maior. 7e83f7b5 recebeu quatro tags
+// naquele dia e o par backend/frontend acumulou 8 builds vermelhos.
+// Ver gamehunter-specs/runbooks/release-tag-duplicada-no-mesmo-commit.md.
+function assertAdvanceGuardMessageDoesNotInviteRetagging() {
+  const workflow = readFileSync(buildWorkflowPath, 'utf8');
+  const line = workflow
+    .split('\n')
+    .find((l) => l.includes('::error::') && l.includes('does not advance'));
+
+  assert.ok(line, 'build reusable must keep the tag-advance guard error');
+
+  assert.ok(
+    !/recrie a tag a partir da main/i.test(line),
+    'tag-advance guard must not tell the operator to recreate the tag from main: recreating reuses the rejected SHA and repeats the failure at a higher number',
+  );
+  assert.match(
+    line,
+    /NAO recrie a tag neste mesmo SHA/,
+    'tag-advance guard must say explicitly not to re-cut on the rejected SHA',
+  );
+  assert.match(
+    line,
+    /REUSE/,
+    'tag-advance guard must point to reusing an existing tag on an already-released commit',
+  );
+}
+
 function assertProtectedModeContract() {
   const deploy = readFileSync(deployWorkflowPath, 'utf8');
   const rollback = readFileSync(rollbackWorkflowPath, 'utf8');
@@ -2039,6 +2072,7 @@ assertDeployUsesOneHardenedSshSession();
 assertDeployTagInputIsNotInterpolatedIntoShellSource();
 assertReleaseIdentityContract();
 assertBuildOnlyIdentityContract();
+assertAdvanceGuardMessageDoesNotInviteRetagging();
 assertProtectedModeContract();
 
 const deployEnv = assertWorkflowHardensEnvFile(deployWorkflowPath, 'deploy workflow', 7);
