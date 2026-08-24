@@ -1547,6 +1547,100 @@ function extractHandoffUpstreamHelpers(workflow) {
     .replace(/\\\\\\\\/g, '\\\\'));
 }
 
+function extractRollbackUpstreamRecoveryHelper(workflow) {
+  const start = workflow.indexOf('            recover_orphaned_handoff_upstream() {');
+  const end = workflow.indexOf('\n\n            read_single_env_value() {', start + 1);
+  assert.ok(
+    start > -1 && end > start,
+    'rollback canonical upstream recovery helper must be extractable',
+  );
+  return workflow
+    .slice(start, end)
+    .replace(/^ {12}/gm, '')
+    .replace(/\\\$/g, () => '$')
+    .replace(/\\\\\\\\/g, '\\\\');
+}
+
+function assertRollbackRestoresCanonicalUpstreamAndChecksEdge() {
+  const workflow = readFileSync(rollbackWorkflowPath, 'utf8');
+  const standardFlow = workflow.slice(workflow.lastIndexOf('            export IMAGE_TAG="$TAG"'));
+  const recoverIndex = standardFlow.indexOf('recover_orphaned_handoff_upstream');
+  const recreateIndex = standardFlow.indexOf('docker compose up -d --no-build');
+  const localHealthIndex = standardFlow.indexOf(
+    'http://localhost:\\$PORT$HEALTH_PATH',
+    recreateIndex,
+  );
+  const edgeHealthIndex = standardFlow.indexOf('https://gamehunter.com.br/api/health');
+  const successIndex = standardFlow.indexOf('echo "OK Rollback to $TAG"');
+
+  assert.ok(
+    recoverIndex > -1 && recreateIndex > recoverIndex,
+    'rollback must restore an orphaned candidate marker before recreating the canonical service',
+  );
+  assert.ok(
+    localHealthIndex > recreateIndex && edgeHealthIndex > localHealthIndex
+      && successIndex > edgeHealthIndex,
+    'backend rollback must prove edge health after local health and before reporting success',
+  );
+}
+
+function runRollbackUpstreamRecoveryFixture(deployWorkflow, rollbackWorkflow) {
+  if (!posixShellFixturesAvailable) return false;
+
+  const [, activateFunction] = extractHandoffUpstreamHelpers(deployWorkflow);
+  const recoverFunction = extractRollbackUpstreamRecoveryHelper(rollbackWorkflow);
+  const fixtureDir = mkdtempSync(resolve(tmpdir(), 'gh-rollback-upstream-recovery-'));
+  const fixturePath = resolve(fixtureDir, 'fixture.sh');
+  const nginxPath = resolve(fixtureDir, 'gamehunter');
+  const originalPath = resolve(fixtureDir, 'gamehunter.original');
+  const script = `#!/usr/bin/env bash
+set -euo pipefail
+SERVICE=backend
+DEPLOY_RUN_ID=960
+HANDOFF_MARKER=''
+HANDOFF_NGINX_SITE='${nginxPath}'
+HANDOFF_NGINX_BACKUP_DIR='${resolve(fixtureDir, 'backups')}'
+
+nginx() { return 0; }
+make_handoff_nginx_backup() {
+  mkdir -p "$HANDOFF_NGINX_BACKUP_DIR"
+  local backup="$HANDOFF_NGINX_BACKUP_DIR/$1.bak"
+  cp "$HANDOFF_NGINX_SITE" "$backup"
+  echo "$backup"
+}
+
+${activateFunction}
+${recoverFunction}
+
+cat > "$HANDOFF_NGINX_SITE" <<'NGINX'
+upstream gamehunter_backend {
+    server 127.0.0.1:3001 max_fails=3 fail_timeout=10s;
+}
+NGINX
+cp "$HANDOFF_NGINX_SITE" '${originalPath}'
+
+activate_handoff_candidate_only_upstream gamehunter_backend 3001 13001
+HANDOFF_MARKER=''
+recover_orphaned_handoff_upstream
+cmp '${originalPath}' "$HANDOFF_NGINX_SITE"
+recover_orphaned_handoff_upstream
+cmp '${originalPath}' "$HANDOFF_NGINX_SITE"
+`;
+
+  try {
+    writeFileSync(fixturePath, script, { mode: 0o700 });
+    const result = spawnSync('bash', [fixturePath], { cwd: fixtureDir, encoding: 'utf8' });
+    assert.equal(
+      result.status,
+      0,
+      `rollback upstream recovery fixture failed:\n${result.stdout}${result.stderr}`,
+    );
+  } finally {
+    rmSync(fixtureDir, { force: true, recursive: true });
+  }
+  return true;
+}
+
 /** Prova que o gate publico nunca enxerga canonical e candidate ao mesmo tempo. */
 function runCandidateOnlyUpstreamFixture(workflow) {
   if (!posixShellFixturesAvailable) return false;
@@ -1940,6 +2034,7 @@ assertSequentialMigrationContract();
 assertEveryRecreateGoesThroughRetry();
 assertDeployHeredocAndRollbackImageAreUnambiguous();
 assertRollbackTagIsValidatedBeforeSsh();
+assertRollbackRestoresCanonicalUpstreamAndChecksEdge();
 assertDeployUsesOneHardenedSshSession();
 assertDeployTagInputIsNotInterpolatedIntoShellSource();
 assertReleaseIdentityContract();
@@ -1971,6 +2066,10 @@ const composeRetryFixtureRan = runComposeRecreateRetryFixture(deployEnv.workflow
 const currentImageFixtureRan = runCurrentServiceImageFixture(deployEnv.workflow);
 const candidateDirectReadinessFixtureRan = runCandidateDirectReadinessFixture(deployEnv.workflow);
 const candidateOnlyUpstreamFixtureRan = runCandidateOnlyUpstreamFixture(deployEnv.workflow);
+const rollbackUpstreamRecoveryFixtureRan = runRollbackUpstreamRecoveryFixture(
+  deployEnv.workflow,
+  rollbackEnv.workflow,
+);
 const sequentialMigrationFixtureRan = runSequentialMigrationDecisionFixture(deployEnv.workflow);
 
 console.log('deploy handoff readiness fixture PASS');
@@ -2010,6 +2109,11 @@ console.log(
   candidateOnlyUpstreamFixtureRan
     ? 'candidate-only public upstream fixture PASS'
     : 'candidate-only public upstream fixture SKIP (requires POSIX shell)',
+);
+console.log(
+  rollbackUpstreamRecoveryFixtureRan
+    ? 'rollback canonical upstream recovery fixture PASS'
+    : 'rollback canonical upstream recovery fixture SKIP (requires POSIX shell)',
 );
 console.log(
   sequentialMigrationFixtureRan
