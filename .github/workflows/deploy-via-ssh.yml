@@ -1689,6 +1689,24 @@ jobs:
               fi
             }
 
+            recover_orphaned_handoff_upstream() {
+              [ -f "\$HANDOFF_NGINX_SITE" ] || return 0
+              local discovered_markers marker_count previous_marker
+              discovered_markers=\$(grep -o "gh-deploy-candidate:$SERVICE:[^[:space:]#]*" \
+                "\$HANDOFF_NGINX_SITE" | sed 's/-canonical$//' | sort -u || true)
+              [ -n "\$discovered_markers" ] || return 0
+              marker_count=\$(printf '%s\n' "\$discovered_markers" | grep -c .)
+              if [ "\$marker_count" -ne 1 ]; then
+                echo "FAIL: found \$marker_count orphaned handoff markers; refusing ambiguous nginx repair"
+                return 1
+              fi
+              previous_marker="\$HANDOFF_MARKER"
+              HANDOFF_MARKER="\$discovered_markers"
+              echo "Recovering orphaned nginx handoff marker before deploy"
+              remove_handoff_candidate_upstream
+              HANDOFF_MARKER="\$previous_marker"
+            }
+
             stop_handoff_candidate() {
               if [ -n "\$HANDOFF_CANDIDATE_CONTAINER" ]; then
                 docker rm -f "\$HANDOFF_CANDIDATE_CONTAINER" >/dev/null 2>&1 || true
@@ -1850,6 +1868,7 @@ jobs:
               start_worker_drain
             fi
 
+            recover_orphaned_handoff_upstream
             prepare_public_handoff
             compose_up_recreate
 
@@ -1872,6 +1891,9 @@ jobs:
             fi
 
             stop_handoff_candidate
+            if ! wait_public_readiness "canonical-only upstream after candidate stop"; then
+              rollback_service "canonical public readiness failed after stopping the handoff candidate"
+            fi
             resume_worker_queue "deploy healthy: $TAG" true
             docker logout ghcr.io
             exit 0

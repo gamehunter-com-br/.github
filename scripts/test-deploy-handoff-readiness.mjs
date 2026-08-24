@@ -139,6 +139,17 @@ function assertWorkflowKeepsGuardBeforeRecreate() {
     /activate_handoff_candidate_only_upstream/,
     'handoff must switch nginx to the candidate before the public gate',
   );
+
+  const standardCompletion = workflow.slice(prepareIndex);
+  const stopCandidate = standardCompletion.lastIndexOf('stop_handoff_candidate');
+  const postStopReadiness = standardCompletion.lastIndexOf(
+    'wait_public_readiness "canonical-only upstream after candidate stop"',
+  );
+  const resumeQueue = standardCompletion.lastIndexOf('resume_worker_queue "deploy healthy: $TAG"');
+  assert.ok(
+    stopCandidate > -1 && postStopReadiness > stopCandidate && resumeQueue > postStopReadiness,
+    'deploy must prove canonical public readiness after stopping the handoff candidate',
+  );
 }
 
 function extractMigrationDecisionBlock(workflow) {
@@ -1582,6 +1593,11 @@ fi
 remove_handoff_candidate_upstream
 cmp '${originalPath}' "$HANDOFF_NGINX_SITE"
 remove_handoff_candidate_upstream
+
+activate_handoff_candidate_only_upstream gamehunter_backend 3001 13001
+HANDOFF_MARKER=''
+recover_orphaned_handoff_upstream
+cmp '${originalPath}' "$HANDOFF_NGINX_SITE"
 `;
 
   try {
