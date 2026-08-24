@@ -90,6 +90,22 @@ jobs:
       # deployou por cima de v2.91.0 e levou o backend 11 commits para tras em
       # 20/08/2026, sem gerar um unico erro: a API respondeu 200 o tempo todo, so
       # que sem os campos novos. Ver gamehunter-specs/runbooks/release-tag-ordem-semver.md.
+      #
+      # A MENSAGEM DE ERRO E PARTE DO GUARD.
+      #
+      # Ate 24/08/2026 a falha dizia "Recrie a tag a partir da main" — e quem recria
+      # costuma reusar o MESMO SHA que acabou de ser recusado, porque so o numero
+      # e recalculado (ele sai de `git ls-remote --tags`; o SHA vem de variavel presa
+      # ao ciclo anterior). O resultado e o mesmo erro num numero maior, em laco:
+      # 7e83f7b5 foi tagueado quatro vezes naquele dia (v2.102.0, v2.103.0, v2.104.0,
+      # v2.105.0), com 8 builds vermelhos entre backend e frontend.
+      #
+      # Um guard que diagnostica certo e prescreve errado vira o motor do incidente.
+      # Ver gamehunter-specs/runbooks/release-tag-duplicada-no-mesmo-commit.md.
+      #
+      # Nao transformar isto em bloqueio de "commit ja tagueado": cortar tag MAIOR
+      # num commit ja tagueado e exatamente o procedimento de restauracao de downgrade
+      # (v2.91.2 sobre 4716f472). Bloquear aqui tiraria o conserto junto com o erro.
       - name: Require release tag to advance the previous release
         if: github.ref_type == 'tag'
         env:
@@ -117,7 +133,7 @@ jobs:
           # 2) e o commit precisa DESCENDER do commit da tag anterior.
           STATUS=$(gh api "/repos/${GITHUB_REPOSITORY}/compare/${PREV}...${GITHUB_SHA}" --jq '.status')
           if [[ "$STATUS" != "ahead" && "$STATUS" != "identical" ]]; then
-            echo "::error::Release tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) does not advance ${PREV} (compare status: $STATUS). Uma tag maior num commit ancestral deploya codigo antigo em silencio. Recrie a tag a partir da main."
+            echo "::error::Release tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) does not advance ${PREV} (compare status: $STATUS). Uma tag maior num commit ancestral deploya codigo antigo em silencio. NAO recrie a tag neste mesmo SHA — seria o mesmo erro num numero maior. Re-resolva o HEAD atual da main AGORA e, antes de cortar, confira se aquele commit ja tem tag semver (git ls-remote --tags, SHA de 40 caracteres): se tiver, REUSE a tag existente em vez de criar outra. Ver gamehunter-specs/runbooks/release-tag-duplicada-no-mesmo-commit.md."
             exit 1
           fi
           echo "::notice::${GITHUB_REF_NAME} avanca ${PREV} (compare: $STATUS)."
