@@ -1932,6 +1932,19 @@ assertProtectedModeContract();
 
 const deployEnv = assertWorkflowHardensEnvFile(deployWorkflowPath, 'deploy workflow', 7);
 const rollbackEnv = assertWorkflowHardensEnvFile(rollbackWorkflowPath, 'rollback workflow', 3);
+const drainStart = deployEnv.workflow.indexOf('            start_worker_drain() {');
+const drainEnd = deployEnv.workflow.indexOf('\n\n            # PROTECTED_RELEASE_FLOW_START', drainStart);
+const drainBlock = deployEnv.workflow.slice(drainStart, drainEnd);
+const drainCapture = drainBlock.indexOf('if drain_output=\\$(docker compose run');
+const drainExitCapture = drainBlock.indexOf('drain_rc=\\$?', drainCapture);
+const drainJsonFallback = drainBlock.indexOf("grep '^{' | tail -n 1 || true", drainExitCapture);
+const drainPublished = drainBlock.indexOf('Deploy-safe worker drain result:', drainExitCapture);
+const drainExit = drainBlock.indexOf('return "\\$drain_rc"', drainPublished);
+assert.ok(
+  drainCapture > -1 && drainExitCapture > drainCapture && drainJsonFallback > drainExitCapture
+    && drainPublished > drainExitCapture && drainExit > drainPublished,
+  'deploy drain must publish its JSON result before propagating a non-zero CLI exit',
+);
 const functionalFixtureRan = [
   runEnvHardeningFixture('deploy workflow', deployEnv.hardeningBlock),
   runEnvHardeningFixture('rollback workflow', rollbackEnv.hardeningBlock),

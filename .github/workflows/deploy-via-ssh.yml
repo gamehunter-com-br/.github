@@ -1035,17 +1035,30 @@ jobs:
                 return 0
               fi
               local created_drain_id
-              local drain_output
+              local drain_output drain_json drain_rc
               WORKER_DRAIN_TIMEOUT_MS=\$(( ${WORKER_DRAIN_TIMEOUT_MINUTES:-15} * 60 * 1000 ))
               echo "Deploy-safe worker drain: timeout=\${WORKER_DRAIN_TIMEOUT_MS}ms"
-              drain_output=\$(docker compose run -T --rm --no-deps "$SERVICE" npm run deploy:workers:drain -- \
+              if drain_output=\$(docker compose run -T --rm --no-deps "$SERVICE" npm run deploy:workers:drain -- \
                 --deploy-ref "$DEPLOY_RUN_ID" \
                 --image-tag "$TAG" \
                 --timeout-ms "\$WORKER_DRAIN_TIMEOUT_MS" \
                 --source github_actions \
-                --json < /dev/null) || return 1
-              echo "\$drain_output"
-              WORKER_DRAIN_ID=\$(printf '%s\n' "\$drain_output" | tail -n 1 \
+                --json < /dev/null); then
+                drain_rc=0
+              else
+                drain_rc=\$?
+              fi
+              drain_json=\$(printf '%s\n' "\$drain_output" | grep '^{' | tail -n 1 || true)
+              if [ -n "\$drain_json" ]; then
+                echo "Deploy-safe worker drain result: \$drain_json"
+              else
+                echo "FAIL: deploy-safe worker drain returned no JSON result"
+              fi
+              if [ "\$drain_rc" -ne 0 ]; then
+                echo "FAIL: deploy-safe worker drain rejected cutover (exit \$drain_rc)"
+                return "\$drain_rc"
+              fi
+              WORKER_DRAIN_ID=\$(printf '%s\n' "\$drain_json" \
                 | sed -n 's/.*"drain_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
               if [[ ! "\$WORKER_DRAIN_ID" =~ ^[A-Za-z0-9._:-]{8,128}$ ]]; then
                 echo "FAIL: drain liberou deploy sem drain_id parseavel"
