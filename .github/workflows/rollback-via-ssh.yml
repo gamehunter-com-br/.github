@@ -180,6 +180,9 @@ jobs:
           ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" 'bash -euo pipefail -s' << EOF
             cd "$VPS_PATH"
 
+            HANDOFF_NGINX_SITE="/etc/nginx/sites-enabled/gamehunter"
+            HANDOFF_NGINX_BACKUP_DIR="/tmp/gamehunter-deploy-nginx-backups"
+
             # ENV_FILE_HARDENING_START
             # .env contem segredos de runtime. O workflow troca apenas IMAGE_TAG,
             # sempre via arquivo temporario no mesmo diretorio e modo 0600.
@@ -393,6 +396,62 @@ jobs:
             }
             # ENV_FILE_HARDENING_END
 
+            recover_orphaned_handoff_upstream() {
+              case "$SERVICE" in
+                backend|frontend) ;;
+                *) return 0 ;;
+              esac
+              [ -f "\$HANDOFF_NGINX_SITE" ] || return 0
+
+              local backup discovered_markers marker marker_count tmp
+              discovered_markers=\$(grep -o "gh-deploy-candidate:$SERVICE:[^[:space:]#]*" \
+                "\$HANDOFF_NGINX_SITE" | sed 's/-canonical$//' | sort -u || true)
+              [ -n "\$discovered_markers" ] || return 0
+              marker_count=\$(printf '%s\n' "\$discovered_markers" | grep -c .)
+              if [ "\$marker_count" -ne 1 ]; then
+                echo "FAIL: found \$marker_count orphaned handoff markers; refusing ambiguous nginx repair"
+                return 1
+              fi
+              marker="\$discovered_markers"
+              tmp=\$(mktemp)
+              mkdir -p "\$HANDOFF_NGINX_BACKUP_DIR"
+              backup="\$HANDOFF_NGINX_BACKUP_DIR/gamehunter.rollback.$DEPLOY_RUN_ID.bak"
+              cp "\$HANDOFF_NGINX_SITE" "\$backup"
+              if ! awk -v marker="\$marker" '
+                {
+                  canonical_prefix = "# " marker "-canonical "
+                  canonical_pos = index(\$0, canonical_prefix)
+                  if (canonical_pos > 0) {
+                    print substr(\$0, canonical_pos + length(canonical_prefix))
+                    restored++
+                    next
+                  }
+                  if (index(\$0, marker) > 0) {
+                    removed++
+                    next
+                  }
+                  print
+                }
+                END { if (restored != 1 || removed != 1) exit 42 }
+              ' "\$HANDOFF_NGINX_SITE" > "\$tmp"; then
+                echo "FAIL: orphaned candidate marker is incomplete; refusing partial nginx restore"
+                rm -f "\$tmp" "\$backup"
+                return 1
+              fi
+              mv "\$tmp" "\$HANDOFF_NGINX_SITE"
+              if nginx -t; then
+                nginx -s reload
+                rm -f "\$backup"
+                echo "Restored canonical-only nginx upstream before rollback"
+              else
+                echo "FAIL: nginx config invalid after rollback restore; restoring candidate-only backup"
+                mv "\$backup" "\$HANDOFF_NGINX_SITE"
+                nginx -t
+                nginx -s reload
+                return 1
+              fi
+            }
+
             read_single_env_value() {
               local key="\$1"
               local count
@@ -572,6 +631,7 @@ jobs:
 
             export IMAGE_TAG="$TAG"
             ALL_SERVICES="$SERVICE $EXTRA_SERVICES"
+            recover_orphaned_handoff_upstream
             if [ "$ROLLBACK_MODE" = "protected-same-image-off" ]; then
               NORMALIZED_SERVICES=\$(printf '%s\n' "\$ALL_SERVICES" | xargs)
               if [ "$SERVICE" != "backend" ] \
@@ -624,18 +684,41 @@ jobs:
 
             PORT=\$(grep "^PORT=" .env | cut -d= -f2 | head -1)
             PORT=\${PORT:-$DEFAULT_PORT}
+            LOCAL_HEALTH_READY=false
             for i in \$(seq 1 30); do
               if curl -fsS --connect-timeout 2 --max-time 8 \
                 "http://localhost:\$PORT$HEALTH_PATH" > /dev/null 2>&1; then
-                echo "OK Rollback to $TAG"
-                docker logout ghcr.io
-                exit 0
+                LOCAL_HEALTH_READY=true
+                break
               fi
               sleep 2
             done
-            echo "FAIL Health pos-rollback — investigar manual"
+            if [ "\$LOCAL_HEALTH_READY" != "true" ]; then
+              echo "FAIL Health local pos-rollback — investigar manual"
+              docker logout ghcr.io
+              exit 1
+            fi
+
+            if [ "$SERVICE" = "backend" ]; then
+              EDGE_HEALTH_READY=false
+              for i in \$(seq 1 30); do
+                if curl -fsS --connect-timeout 2 --max-time 8 \
+                  "https://gamehunter.com.br/api/health" > /dev/null 2>&1; then
+                  EDGE_HEALTH_READY=true
+                  break
+                fi
+                sleep 2
+              done
+              if [ "\$EDGE_HEALTH_READY" != "true" ]; then
+                echo "FAIL Health da borda publica pos-rollback — upstream nginx nao confirmado"
+                docker logout ghcr.io
+                exit 1
+              fi
+            fi
+
+            echo "OK Rollback to $TAG"
             docker logout ghcr.io
-            exit 1
+            exit 0
           EOF
 
       - name: Summary
