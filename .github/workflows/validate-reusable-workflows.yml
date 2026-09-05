@@ -64,3 +64,6 @@ jobs:
       # passa batido e o worker deixa de reiniciar em silencio, que e o bug que o PR conserta.
       - name: Validate worker deploy regex contract
         run: node scripts/test-worker-deploy-regex.mjs
+
+      - name: Validate Sentry build secret contract
+        run: node --test scripts/test-sentry-build-secret.mjs

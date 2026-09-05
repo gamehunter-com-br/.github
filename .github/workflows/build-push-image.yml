@@ -27,6 +27,11 @@ on:
         required: false
         default: ''
         type: string
+      sentry-buildkit-secret:
+        description: 'Pass Sentry only as a BuildKit secret, force a real build and provide SENTRY_UPLOAD_RUN to invalidate only the upload RUN. Consumer Dockerfile must consume that public nonce.'
+        required: false
+        default: false
+        type: boolean
     secrets:
       NPM_PACKAGES_READ_TOKEN:
         description: 'PAT com read:packages pra cross-repo deps. Fallback pra GITHUB_TOKEN.'
@@ -68,6 +73,17 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 1
+
+      - name: Validate Sentry secret channel
+        if: inputs.sentry-buildkit-secret
+        env:
+          EXTRA_BUILD_ARGS: ${{ inputs.extra-build-args }}
+        run: |
+          set -euo pipefail
+          if printf '%s\n' "$EXTRA_BUILD_ARGS" | grep -Eq '^[[:space:]]*(SENTRY_AUTH_TOKEN|SENTRY_UPLOAD_RUN)[[:space:]]*='; then
+            echo '::error::Sentry opt-in reserves SENTRY_AUTH_TOKEN and SENTRY_UPLOAD_RUN; do not pass them through extra-build-args.'
+            exit 1
+          fi
 
       - name: Require release tag on main
         if: github.ref_type == 'tag'
@@ -172,7 +188,7 @@ jobs:
       # manifest existente via crane (~3s, sem download da imagem).
       - name: Check if SHA image already exists (tag-only fast path)
         id: skip
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' && !inputs.sentry-buildkit-secret
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -212,8 +228,11 @@ jobs:
           cache-to: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache,mode=max
           build-args: |
             NODE_AUTH_TOKEN=${{ secrets.NPM_PACKAGES_READ_TOKEN || secrets.GITHUB_TOKEN }}
-            SENTRY_AUTH_TOKEN=${{ secrets.SENTRY_AUTH_TOKEN }}
+            ${{ !inputs.sentry-buildkit-secret && format('SENTRY_AUTH_TOKEN={0}', secrets.SENTRY_AUTH_TOKEN) || '' }}
+            ${{ inputs.sentry-buildkit-secret && format('SENTRY_UPLOAD_RUN={0}-{1}', github.run_id, github.run_attempt) || '' }}
             ${{ inputs.extra-build-args }}
+          secrets: |
+            ${{ inputs.sentry-buildkit-secret && format('SENTRY_AUTH_TOKEN={0}', secrets.SENTRY_AUTH_TOKEN) || '' }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
