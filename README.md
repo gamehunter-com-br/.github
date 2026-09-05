@@ -173,6 +173,29 @@ Use override `deploy-workers=true` quando a release docs/API-only ainda precisa 
 Use `deploy-workers=false` quando a mudanca de backend nao toca runtime dos workers e o diff automatico for
 conservador demais.
 
+## Sentry no build de imagem
+
+O input opcional `sentry-buildkit-secret: true` de `build-push-image.yml` move
+`SENTRY_AUTH_TOKEN` do canal `build-args` para o secret BuildKit do mesmo nome.
+Os callers que não optam mantêm o comportamento anterior. O token continua
+vindo do secret do caller, sem novo nível de permissão.
+
+O Dockerfile do consumer deve remover `ARG SENTRY_AUTH_TOKEN` e ler o arquivo
+temporário `/run/secrets/SENTRY_AUTH_TOKEN` somente no `RUN --mount=type=secret`.
+Não copie o token nem o persista com `ENV`. O opt-in também fornece o argumento
+público `SENTRY_UPLOAD_RUN` (`run_id-run_attempt`); declare-o imediatamente antes
+do build e consuma-o nesse `RUN`. Assim o upload roda de novo, sem invalidar os
+caches de instalação anteriores: o conteúdo de um secret não invalida cache.
+
+Esse modo não reutiliza a imagem `sha-*` pelo fast path. Uma imagem manual
+anterior, sem upload ou com outra release, não pode substituir silenciosamente
+o build da tag. As validações de tag, identidade OCI e publicação permanecem.
+O consumer decide se ausência de token é aceitável em build local ou se o
+upload de uma release deve falhar; o reusable não altera essa política.
+
+Referências: [secrets de build](https://docs.docker.com/build/building/secrets/)
+e [invalidação de cache](https://docs.docker.com/build/cache/invalidation/).
+
 ## Política de versionamento
 
 - Reusable workflows são pinned por **tag semver** (`@v1`) em produção, ou por
