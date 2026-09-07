@@ -102,6 +102,29 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --tags --force "https://x-access-token:${RELEASE_TAG_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          # COMMIT JA ETIQUETADO = RELEASE JA ACONTECEU.
+          #
+          # Em 07/09/2026 dois "Promote Release" do gamehunter-backend, com 39 s de
+          # diferenca e o mesmo ref (f1064ba3), criaram v2.111.1 e v2.111.2 no MESMO
+          # commit. A guarda abaixo ("tag seguinte ja existe") so protege o numero,
+          # nao o commit; e tag e imutavel pelo ruleset, entao a serie ficou com duas
+          # versoes identicas para sempre. Se o HEAD ja carrega uma tag semver, este
+          # run devolve a tag existente (outputs iguais aos de um promote normal,
+          # created=false) e termina verde sem cortar outra: o operador segue para o
+          # build/deploy da tag que ja existe.
+          existing="$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+          if [ -n "$existing" ]; then
+            echo "::notice::Commit $(git rev-parse --short HEAD) is already tagged as ${existing}; no new tag will be created"
+            {
+              echo "latest=${existing}"
+              echo "tag=${existing}"
+              echo "sha=$(git rev-parse HEAD)"
+              echo "created=false"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           latest="$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
           latest="${latest:-v0.0.0}"
           version="${latest#v}"
@@ -123,8 +146,10 @@ jobs:
           echo "latest=${latest}" >> "$GITHUB_OUTPUT"
           echo "tag=${next}" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "created=true" >> "$GITHUB_OUTPUT"
 
       - name: Create and push tag
+        if: steps.next.outputs.created == 'true'
         env:
           RELEASE_TAG_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
           NEXT_TAG: ${{ steps.next.outputs.tag }}
@@ -136,8 +161,15 @@ jobs:
           git push "https://x-access-token:${RELEASE_TAG_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${NEXT_TAG}"
 
       - name: Summary
+        env:
+          CREATED: ${{ steps.next.outputs.created }}
         run: |
-          echo "## Release promoted" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Previous tag: \`${{ steps.next.outputs.latest }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- New tag: \`${{ steps.next.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$CREATED" = "true" ]; then
+            echo "## Release promoted" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Previous tag: \`${{ steps.next.outputs.latest }}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- New tag: \`${{ steps.next.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Release already promoted" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Existing tag: \`${{ steps.next.outputs.tag }}\` (commit ja etiquetado; nenhuma tag nova foi criada)" >> "$GITHUB_STEP_SUMMARY"
+          fi
           echo "- Tagged SHA: \`${{ steps.next.outputs.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
