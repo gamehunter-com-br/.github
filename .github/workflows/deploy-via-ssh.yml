@@ -664,13 +664,43 @@ jobs:
               return "\$diff_status"
             }
             # MIGRATION_DECISION_END
+            # PULL_RETRY_START
+            # GHCR devolveu "error from registry: unauthorized" um segundo depois
+            # de "Login Succeeded" no deploy v2.111.3 do backend (07/09/2026, run
+            # 34149730367, tentativa 1): imagem publicada, token valido, rerun
+            # manual passou sem mudar nada. Tres tentativas com re-login cobrem o
+            # transitorio; tres falhas seguidas continuam derrubando o deploy com
+            # a mensagem do registro, antes de qualquer troca de container.
+            PULL_RETRY_DELAYS="10 30"
+            registry_login() {
+              echo "$GHCR_PULL_TOKEN" | docker login ghcr.io -u "$GH_OWNER" --password-stdin
+            }
+            pull_with_retry() {
+              local attempt=1 max_attempts=3 delay
+              local -a delays=(\$PULL_RETRY_DELAYS)
+              while :; do
+                if "\$@"; then
+                  return 0
+                fi
+                echo "pull attempt \$attempt/\$max_attempts failed: \$*" >&2
+                if [ "\$attempt" -ge "\$max_attempts" ]; then
+                  echo "FAIL: image pull failed after \$max_attempts attempts" >&2
+                  return 1
+                fi
+                delay="\${delays[\$((attempt - 1))]:-30}"
+                sleep "\$delay"
+                registry_login || echo "pull retry: docker login failed; retrying the pull anyway" >&2
+                attempt=\$((attempt + 1))
+              done
+            }
+            # PULL_RETRY_END
 
             trap 'status=\$?; cleanup_env_tmp; exit \$status' EXIT
 
             git fetch origin main
             git reset --hard origin/main
 
-            echo "$GHCR_PULL_TOKEN" | docker login ghcr.io -u "$GH_OWNER" --password-stdin
+            registry_login
 
             CURRENT=\$(resolve_current_service_image_id "$SERVICE") || exit 1
             ROLLBACK_RELEASE_TAG=""
@@ -714,7 +744,7 @@ jobs:
 
             ALL_SERVICES="$SERVICE \$EXTRA_SERVICES_EFFECTIVE"
             if [ "$CUTOVER_MODE" = "standard" ]; then
-              docker compose pull \$ALL_SERVICES
+              pull_with_retry docker compose pull \$ALL_SERVICES
               if [ "$RELEASE_IDENTITY_ENABLED" = "true" ]; then
                 resolve_release_identity \
                   "$IMAGE:$TAG" "$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST"
@@ -1573,7 +1603,7 @@ jobs:
 
             run_protected_release_flow() {
               assert_protected_runtime_controls || return 1
-              docker pull "$IMAGE:$TAG" || return 1
+              pull_with_retry docker pull "$IMAGE:$TAG" || return 1
               resolve_release_identity \
                 "$IMAGE:$TAG" "$TAG" "$EXPECTED_GIT_SHA" "$EXPECTED_IMAGE_DIGEST" || return 1
               PROTECTED_IDENTITY_VERIFIED=true
