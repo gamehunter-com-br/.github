@@ -85,12 +85,12 @@ set -euo pipefail
 GHCR_PULL_TOKEN=t0ken
 GH_OWNER=gamehunter-com-br
 ATTEMPTS=0
-LOGINS=0
 sleep() { echo "sleep $1"; }
 docker() {
   case "$1" in
     login)
-      LOGINS=$((LOGINS + 1))
+      # roda dentro do pipe de registry_login (subshell): conta pela saida, nao por variavel
+      echo "login called"
       return 0
       ;;
     compose|pull)
@@ -107,22 +107,28 @@ docker() {
 }
 ${block}
 if pull_with_retry docker compose pull backend workers; then rc=0; else rc=$?; fi
-echo "rc=$rc ATTEMPTS=$ATTEMPTS LOGINS=$LOGINS"
+echo "rc=$rc ATTEMPTS=$ATTEMPTS"
 exit 0
 `;
 
   const transient = runFixture('gh-pull-retry-ok-', fixture(3));
   assert.equal(transient.status, 0, `transient fixture must run:\n${transient.stdout}${transient.stderr}`);
   assert.match(transient.stdout, /pulled on attempt 3/, 'third attempt must succeed');
-  assert.match(transient.stdout, /rc=0 ATTEMPTS=3 LOGINS=2/, `two re-logins and success:\n${transient.stdout}`);
-  assert.match(transient.stdout, /sleep 10\nsleep 30/, 'delays must be 10 s then 30 s');
+  assert.match(transient.stdout, /rc=0 ATTEMPTS=3/, `success on the third attempt:\n${transient.stdout}`);
+  assert.equal((transient.stdout.match(/login called/g) || []).length, 2, `two re-logins between attempts:\n${transient.stdout}`);
+  assert.match(
+    transient.stdout,
+    /sleep 10\nlogin called\nsleep 30\nlogin called/,
+    'delays must be 10 s then 30 s, each followed by a re-login',
+  );
   assert.match(transient.stderr, /pull attempt 1\/3 failed: docker compose pull backend workers/);
   assert.match(transient.stderr, /pull attempt 2\/3 failed/);
   assert.doesNotMatch(transient.stderr, /FAIL: image pull failed/);
 
   const permanent = runFixture('gh-pull-retry-fail-', fixture(99));
   assert.equal(permanent.status, 0, `permanent fixture must run:\n${permanent.stdout}${permanent.stderr}`);
-  assert.match(permanent.stdout, /rc=1 ATTEMPTS=3 LOGINS=2/, `permanent failure must stop after three attempts:\n${permanent.stdout}`);
+  assert.match(permanent.stdout, /rc=1 ATTEMPTS=3/, `permanent failure must stop after three attempts:\n${permanent.stdout}`);
+  assert.equal((permanent.stdout.match(/login called/g) || []).length, 2, 'no login after the last attempt');
   assert.match(permanent.stderr, /FAIL: image pull failed after 3 attempts/);
   return true;
 }

@@ -152,6 +152,21 @@ function assertWorkflowKeepsGuardBeforeRecreate() {
   );
 }
 
+// O fluxo protegido chama pull_with_retry (spec deploy-pull-sem-retry-no-registro); o helper
+// vive fora do bloco PROTECTED_RELEASE_FLOW e entra no fixture pelo mesmo mecanismo.
+function extractPullRetryBlock(workflow) {
+  const startMarker = '            # PULL_RETRY_START';
+  const endMarker = '            # PULL_RETRY_END';
+  const start = workflow.indexOf(startMarker);
+  const end = workflow.indexOf(endMarker, start);
+  assert.ok(start > -1, 'deploy workflow must contain the pull retry start marker');
+  assert.ok(end > start, 'deploy workflow must contain the pull retry end marker');
+  return workflow
+    .slice(start, end + endMarker.length)
+    .replace(/\r\n/g, '\n')
+    .replace(/\\\$/g, () => '$');
+}
+
 function extractMigrationDecisionBlock(workflow) {
   const start = workflow.indexOf(migrationDecisionStart);
   const end = workflow.indexOf(migrationDecisionEnd, start);
@@ -1184,6 +1199,10 @@ wait_local_health() { record "LOCAL_HEALTH $*"; [ "$FAIL_PHASE" != health ]; }
 wait_public_readiness() { record "PUBLIC_HEALTH $*"; [ "$FAIL_PHASE" != health ]; }
 public_readiness_ok() { [ "$FAIL_PHASE" != health ]; }
 sleep() { :; }
+GHCR_PULL_TOKEN=fixture-token
+GH_OWNER=fixture-owner
+
+${extractPullRetryBlock(workflow)}
 
 ${extractComposeRecreateHelper(workflow)}
 
