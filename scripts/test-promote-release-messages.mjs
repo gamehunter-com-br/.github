@@ -184,3 +184,79 @@ console.log(
     ? 'promote-release fetch-vs-ancestry fixture PASS'
     : 'promote-release fetch-vs-ancestry fixture SKIP (requires POSIX shell)',
 );
+
+/**
+ * GUARD 3 — commit ja etiquetado nao recebe outra tag.
+ *
+ * Em 07/09/2026 dois `Promote Release` do gamehunter-backend, com 39 s de
+ * diferenca e o mesmo ref (f1064ba3), criaram v2.111.1 e v2.111.2 no MESMO
+ * commit. A guarda existente ("tag seguinte ja existe") protege o numero, nao o
+ * commit. O passo `Compute next tag` precisa devolver a tag existente com
+ * created=false e sair verde, e o passo de push precisa ficar condicionado.
+ */
+function assertAlreadyTaggedCommitIsNotRetagged() {
+  const block = extractRunBlock('Compute next tag');
+  assert.match(block, /git tag --points-at HEAD/, 'Compute next tag must look for semver tags on the target commit');
+  assert.match(block, /created=false/, 'an already-tagged commit must report created=false');
+  assert.match(block, /created=true/, 'the normal path must report created=true');
+  assert.match(
+    workflow,
+    /- name: Create and push tag\n\s+if: steps\.next\.outputs\.created == 'true'/,
+    'the tag push step must be skipped when created=false',
+  );
+
+  if (!posixShellFixturesAvailable) return false;
+
+  // O bloco roda num subshell: o caminho "ja etiquetado" termina com `exit 0`, e o
+  // fixture ainda precisa imprimir o GITHUB_OUTPUT depois.
+  const repoSetup = `#!/usr/bin/env bash
+set -euo pipefail
+export BUMP=patch
+export RELEASE_TAG_TOKEN=t0ken
+export GITHUB_REPOSITORY=gamehunter-com-br/gamehunter-backend
+export GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.com
+export GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.com
+export GITHUB_OUTPUT="$PWD/outputs.txt"
+: > "$GITHUB_OUTPUT"
+# fetch autenticado nao existe no fixture; todo o resto e git real num repositorio temporario.
+git() { if [ "$1" = fetch ]; then return 0; fi; command git "$@"; }
+export -f git 2>/dev/null || true
+git init -q repo && cd repo
+echo a > a.txt && git add -A && git commit -qm c1 && git tag -a v1.2.3 -m 'Release v1.2.3'
+`;
+
+  const tagged = runFixture('gh-promote-tagged-', `${repoSetup}
+(
+${block}
+)
+echo '---outputs---'
+cat "$GITHUB_OUTPUT"
+`);
+  assert.equal(tagged.status, 0, `already-tagged commit must exit 0:\n${tagged.stdout}${tagged.stderr}`);
+  assert.match(tagged.stdout, /::notice::Commit [0-9a-f]+ is already tagged as v1\.2\.3/, 'must announce the existing tag');
+  assert.match(tagged.stdout, /\ntag=v1\.2\.3\n/, 'outputs must point at the existing tag');
+  assert.match(tagged.stdout, /\ncreated=false\n/, 'outputs must say no tag was created');
+  assert.doesNotMatch(tagged.stdout, /tag=v1\.2\.4/, 'must NOT compute a next tag for an already-tagged commit');
+
+  const untagged = runFixture('gh-promote-untagged-', `${repoSetup}
+echo b > b.txt && git add -A && git commit -qm c2
+(
+${block}
+)
+echo '---outputs---'
+cat "$GITHUB_OUTPUT"
+`);
+  assert.equal(untagged.status, 0, `untagged commit must exit 0:\n${untagged.stdout}${untagged.stderr}`);
+  assert.match(untagged.stdout, /\nlatest=v1\.2\.3\n/, 'latest must be the previous tag');
+  assert.match(untagged.stdout, /\ntag=v1\.2\.4\n/, 'next tag must be computed for an untagged commit');
+  assert.match(untagged.stdout, /\ncreated=true\n/, 'outputs must say a tag will be created');
+  assert.doesNotMatch(untagged.stdout, /::notice::/, 'no notice on the normal path');
+  return true;
+}
+
+const taggedFixtureRan = assertAlreadyTaggedCommitIsNotRetagged();
+console.log(
+  taggedFixtureRan
+    ? 'promote-release already-tagged commit fixture PASS'
+    : 'promote-release already-tagged commit fixture SKIP (requires POSIX shell)',
+);

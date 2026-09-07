@@ -16,6 +16,10 @@ Cria a próxima tag semver (`vX.Y.Z`) a partir do último tag existente.
 **Inputs:**
 - `bump` (string, choice: patch/minor/major) — tipo de bump.
 - `ref` (string, default `main`) — branch/SHA pra tagar (deve ser ancestor de main).
+- Commit que **já carrega** uma tag `vX.Y.Z` não recebe outra: o run termina verde com `::notice::`, os
+  outputs do passo `next` apontam a tag existente e `created=false`. Em 07/09/2026 dois disparos com 39 s de
+  diferença sobre o mesmo commit criaram `v2.111.1` e `v2.111.2` no backend; como tag é imutável, a série
+  ficou com duas versões idênticas. A guarda anterior só conferia se o número seguinte já existia.
 
 **Secrets:**
 - `RELEASE_TAG_TOKEN` — PAT com permissão `contents: write` que dispara workflows downstream (`GITHUB_TOKEN` não dispara).
