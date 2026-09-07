@@ -266,33 +266,63 @@ jobs:
 
           if [ "$SERVICE" = "backend" ] && [ "$MODE" = "auto" ]; then
             git fetch --tags --force origin '+refs/tags/*:refs/tags/*' >/dev/null 2>&1 || true
+            # WORKER_AUTO_MODE_START
+            # "Tag anterior" = a maior tag semver que aponta para OUTRO commit. Em
+            # 07/09/2026 a v2.111.2 (duplicata da v2.111.1, mesmo commit) foi
+            # escolhida como anterior, o diff saiu vazio e os workers ficaram na
+            # versao velha (run 34139971702: "auto compare v2.111.2..v2.111.1").
+            # Sem tag comparavel, o lado barato do erro e reiniciar: MODE=true.
+            TARGET_COMMIT=""
             if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              TARGET_COMMIT=$(git rev-parse -q --verify "$TAG^{commit}" 2>/dev/null || true)
+            fi
+            PREV_TAG=""
+            if [ -n "$TARGET_COMMIT" ]; then
+              # Lista em ordem semver decrescente: so as tags ABAIXO da alvo sao
+              # "anteriores" (redeploy de tag antiga compara com a anterior dela,
+              # nao com a mais nova), e tag no mesmo commit da alvo e pulada.
               TAG_CANDIDATES=$(git tag --list 'v*.*.*' --sort=-v:refname)
-              PREV_TAG=""
+              seen_target=false
               while IFS= read -r candidate; do
-                if [ "$candidate" != "$TAG" ]; then
-                  PREV_TAG="$candidate"
-                  break
+                [ -n "$candidate" ] || continue
+                if [ "$candidate" = "$TAG" ]; then
+                  seen_target=true
+                  continue
                 fi
+                [ "$seen_target" = true ] || continue
+                candidate_commit=$(git rev-parse -q --verify "$candidate^{commit}" 2>/dev/null || true)
+                [ -n "$candidate_commit" ] || continue
+                [ "$candidate_commit" != "$TARGET_COMMIT" ] || continue
+                PREV_TAG="$candidate"
+                break
               done <<< "$TAG_CANDIDATES"
-              if [ -n "$PREV_TAG" ] && git rev-parse -q --verify "$PREV_TAG^{commit}" >/dev/null && git rev-parse -q --verify "$TAG^{commit}" >/dev/null; then
-                CHANGED_FILES=$(git diff --name-only "$PREV_TAG" "$TAG")
-                REASON="auto compare $PREV_TAG..$TAG"
-              else
-                CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD)
-                REASON="auto fallback HEAD tree"
-              fi
+            fi
+            if [ -n "$PREV_TAG" ]; then
+              CHANGED_FILES=$(git diff --name-only "$PREV_TAG" "$TAG")
+              REASON="auto compare $PREV_TAG..$TAG"
+            elif [ -n "$TARGET_COMMIT" ]; then
+              MODE=true
+              REASON="auto fail-safe: nenhuma tag semver anterior aponta para outro commit"
             else
-              CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD)
-              REASON="auto sha fallback HEAD tree"
+              MODE=true
+              REASON="auto fail-safe: tag $TAG nao e semver resolvivel"
             fi
 
-            WORKER_DEPLOY_RE='^(src/(queue|workers|services/jobs|services/affiliates|db)/|src/services/(admin/job-runs|job-ledger-cleanup)\.js|scripts/deploy-|docker-compose\.yml|package\.json|pnpm-lock\.yaml|\.github/workflows/(build-image|deploy)\.yml)'
-            if grep -Eq "$WORKER_DEPLOY_RE" <<< "$CHANGED_FILES"; then
-              MODE=true
-            else
-              MODE=false
+            # Qualquer arquivo de runtime reinicia os workers: os jobs importam
+            # servicos de fora de src/services/affiliates (hardware-catalog-service,
+            # llm-*), src/lib e config. Ate 07/09/2026 a lista era fechada e o fix
+            # de hardware daquele dia (src/services/hardware-catalog-service.js)
+            # nao casava. So docs, testes fora de src e CI que nao seja deploy
+            # escapam; errar para o lado do restart custa um drain.
+            WORKER_DEPLOY_RE='^(src/|config/|scripts/|package\.json|pnpm-lock\.yaml|docker-compose\.yml|Dockerfile|\.github/workflows/(build-image|deploy)\.yml)'
+            if [ "$MODE" = "auto" ]; then
+              if grep -Eq "$WORKER_DEPLOY_RE" <<< "$CHANGED_FILES"; then
+                MODE=true
+              else
+                MODE=false
+              fi
             fi
+            # WORKER_AUTO_MODE_END
           fi
 
           if [[ "$MODE" != "auto" && "$MODE" != "true" && "$MODE" != "false" ]]; then

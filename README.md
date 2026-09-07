@@ -132,11 +132,14 @@ Deploya uma imagem GHCR no VPS via Docker Compose.
 
 - `extra-services` (string, default `''`) - services adicionais no compose, ex.: `workers`.
 - `deploy-workers` (string, default `auto`) - `auto`, `true` ou `false`. Em `false`, remove `workers` da lista
-  efetiva; em `true`, adiciona `workers` para backend. Em `auto`, o reusable compara o tag atual com o tag semver
-  anterior e so reinicia `workers` quando mudam paths de runtime de jobs/workers: `src/queue/`, `src/workers/`,
-  `src/services/jobs/`, `src/services/affiliates/`, `src/services/admin/job-runs.js`,
-  `src/services/job-ledger-cleanup.js`, `src/db/`, `scripts/deploy-*`, `docker-compose.yml`, lock/package ou os
-  workflows de deploy/build.
+  efetiva; em `true`, adiciona `workers` para backend. Em `auto`, o reusable compara o tag alvo com a maior tag
+  semver anterior que aponte para OUTRO commit (tag duplicada no mesmo commit e pulada: em 07/09/2026 a
+  `v2.111.2`, duplicata da `v2.111.1`, deu diff vazio e deixou os workers na versao velha) e reinicia
+  `workers` quando o diff toca qualquer arquivo de runtime: `src/` (inteiro, inclusive testes dentro de
+  `src/`), `config/`, `scripts/`, `package.json`, `pnpm-lock.yaml`, `docker-compose.yml`, `Dockerfile` ou os
+  workflows de deploy/build. So docs, testes fora de `src/` e CI que nao seja deploy dispensam o restart. Sem
+  tag anterior comparavel (primeira tag, tag `sha-*`), `auto` resolve `true`: errar para o lado do restart
+  custa um drain; errar para o outro lado deixa o fix fora do ar em silencio.
 - `worker-drain-enabled` (string, default `'true'`) - quando `true` e `workers` esta na lista efetiva, roda
   `npm run deploy:workers:drain` antes do restart.
 - `worker-drain-timeout-minutes` (string, default `'15'`) - timeout do drain.
