@@ -65,5 +65,11 @@ jobs:
       - name: Validate worker deploy regex contract
         run: node scripts/test-worker-deploy-regex.mjs
 
+      # O pull da imagem no VPS morreu com "unauthorized" transitorio do GHCR em
+      # 07/09/2026 (backend v2.111.3, imagem publicada, rerun passou). O fixture roda o
+      # helper REAL extraido do heredoc com um docker() que falha e depois passa.
+      - name: Validate image pull retry contract
+        run: node scripts/test-pull-retry.mjs
+
       - name: Validate Sentry build secret contract
         run: node --test scripts/test-sentry-build-secret.mjs

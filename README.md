@@ -156,6 +156,12 @@ Deploya uma imagem GHCR no VPS via Docker Compose.
 - `public-readiness-timeout-seconds` (string, default `'90'`) - tempo maximo do gate publico/nginx. Falha aciona
   o rollback ja existente do reusable.
 
+O pull da imagem no VPS (`docker compose pull` no modo `standard`, `docker pull` do candidato nos modos protegidos)
+tenta ate 3 vezes, esperando 10 s e 30 s e refazendo o `docker login` entre tentativas (`pull_with_retry`): em
+07/09/2026 o GHCR devolveu `unauthorized` um segundo depois de `Login Succeeded` com a imagem publicada, e o
+deploy morria antes de tocar em container. Tres falhas seguidas continuam derrubando o deploy com a mensagem do
+registro.
+
 O drain roda depois da migration do backend, usando a nova imagem ja pullada, e antes de `docker compose up` recriar
 `workers`. Em sucesso de health, o workflow chama `npm run deploy:workers:resume`; em rollback/falha, o trap tenta
 retomar a fila em best-effort. Exit codes do drain: `0` libera, `20` bloqueia por politica, `21` timeout, `22` estado
