@@ -65,7 +65,7 @@ on:
       runner:
         description: 'GitHub Actions runner'
         required: false
-        default: blacksmith-4vcpu-ubuntu-2404
+        default: ubuntu-latest
         type: string
     secrets:
       SSH_PRIVATE_KEY:

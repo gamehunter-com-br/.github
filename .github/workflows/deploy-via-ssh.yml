@@ -116,7 +116,7 @@ on:
       runner:
         description: 'GitHub Actions runner'
         required: false
-        default: blacksmith-4vcpu-ubuntu-2404
+        default: ubuntu-latest
         type: string
       tag:
         description: 'Tag pra deployar (workflow_dispatch input passthrough)'
