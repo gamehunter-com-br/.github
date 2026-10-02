@@ -84,7 +84,7 @@ Publica package npm no GitHub Packages quando tag `vX.Y.Z` é pushada.
 
 **Inputs:**
 - `node-version` (string, default `'22'`)
-- `runner` (string, default `blacksmith-4vcpu-ubuntu-2404`)
+- `runner` (string, default `ubuntu-latest`)
 - `build-command` (string, default `npm run build`)
 - `publish-command` (string, default `npm publish`)
 - `needs-cross-repo-deps` (boolean, default `false`) — set `true` se o package
